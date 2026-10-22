@@ -1,3 +1,6 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     // AGP 9 已内置 Kotlin 编译支持（built-in Kotlin），无需再应用 kotlin-android 插件，
@@ -10,6 +13,44 @@ kotlin {
     }
 }
 
+// ===== 自动版本号：无需每次手动修改 =====
+// versionCode = 当前分支提交总数（每次提交自动 +1，保证单调递增）
+// versionName = 最近的 v* tag（如 v1.2 -> "1.2"）；没有 tag 时回退为 "1.0.提交数"
+fun gitCommitCount(): Int = try {
+    providers.exec {
+        commandLine("git", "rev-list", "--count", "HEAD")
+    }.standardOutput.asText.get().trim().toInt()
+} catch (e: Exception) {
+    1
+}
+
+fun gitVersionName(): String = try {
+    val tags = providers.exec {
+        commandLine("git", "tag", "--list", "v*")
+    }.standardOutput.asText.get().trim().lines()
+        .map { it.removePrefix("v").trim() }
+        .filter { it.matches(Regex("""\d+(\.\d+)*""")) }
+    if (tags.isEmpty()) {
+        "1.0.${gitCommitCount()}"
+    } else {
+        // 按语义化版本取最大：v1.10 > v1.9 > v1.2
+        tags.maxByOrNull { t ->
+            val p = t.split(".").map { it.toIntOrNull() ?: 0 }
+            p.getOrElse(0) { 0 } * 1_000_000 + p.getOrElse(1) { 0 } * 1_000 + p.getOrElse(2) { 0 }
+        } ?: "1.0.${gitCommitCount()}"
+    }
+} catch (e: Exception) {
+    "1.0.${gitCommitCount()}"
+}
+
+// ===== 正式签名：密钥信息在 keystore.properties（已 gitignore，不进仓库） =====
+// keystore.properties 不存在时（如 clone 后首次构建）自动回退 debug 签名
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) FileInputStream(f).use { load(it) }
+}
+val hasReleaseKeystore = keystoreProps["storeFile"] != null
+
 android {
     namespace = "io.github.imroxy2222.lsp_colorOSRecord"
     compileSdk {
@@ -20,8 +61,8 @@ android {
         applicationId = "io.github.imroxy2222.lsp_colorOSRecord"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = gitCommitCount()
+        versionName = gitVersionName()
     }
 
     buildTypes {
@@ -33,8 +74,17 @@ android {
                 enable = true
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
             }
-            // 便于直接安装 release 包进行验证（正式发布请换成自己的签名）
-            signingConfig = signingConfigs["debug"]
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.create("release") {
+                    storeFile = rootProject.file(keystoreProps["storeFile"] as String)
+                    storePassword = keystoreProps["storePassword"] as String
+                    keyAlias = keystoreProps["keyAlias"] as String
+                    keyPassword = keystoreProps["keyPassword"] as String
+                }
+            } else {
+                // 便于直接安装 release 包进行验证；正式分发请配置 keystore.properties
+                signingConfig = signingConfigs["debug"]
+            }
         }
     }
 

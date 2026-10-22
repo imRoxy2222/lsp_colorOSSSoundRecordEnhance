@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- LSPosed 模块列表中显示的模块名与描述 -->
-    <string name="app_name">ColorOS 录音机自动转文本</string>
-    <string name="app_description">通话录音（电话/QQ/微信）入库后自动触发转文本，无需手动点击</string>
+    <string name="app_name">ColorOS录音增强</string>
+    <string name="app_description">录音APP右上角展开可一键转文本,搜索功能可搜索转文本后的文字,不再局限于搜索摘要</string>
 </resources>
