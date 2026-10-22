@@ -159,6 +159,15 @@ class ScanButtonInjector(
     }
 
     /**
+     * 防重入标记：点击后置位，扫描线程入队完毕（或失败）后复位。
+     * 与 [ConvertQueue.isActive] 配合，双重防止批量进行中重复点击
+     * 造成队列清空重建 / 并发转文本 / 计数错乱。
+     * 在主线程点击回调里同步检查（点击事件本身串行），无竞态。
+     */
+    @Volatile
+    private var scanning = false
+
+    /**
      * 扫描通话录音并批量入队转文本。
      *
      * 从最新往旧遍历 record_type==3 的录音，**跳过已转完的**（ConvertDbUtil.checkAlreadyConvertComplete），
@@ -171,6 +180,14 @@ class ScanButtonInjector(
             Toast.makeText(activity, "转文本引擎未就绪", Toast.LENGTH_SHORT).show()
             return
         }
+        // 防重入：批量进行中（或上一次扫描还没入队完）再点直接忽略。
+        // 进行中的转文本任务无法取消，重建队列会导致新旧两条并发转换、易被限流。
+        if (scanning || ConvertQueue.isActive()) {
+            XLog.i("scan ignored: batch already in progress (scanning=$scanning)")
+            Toast.makeText(activity, "已有转文本任务进行中，请等待完成", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scanning = true
         val convertAll = limit == Int.MAX_VALUE
         Toast.makeText(
             activity,
@@ -245,6 +262,8 @@ class ScanButtonInjector(
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(activity, "扫描失败: ${t.message}", Toast.LENGTH_LONG).show()
                 }
+            } finally {
+                scanning = false
             }
         }.apply {
             isDaemon = true

@@ -64,6 +64,18 @@ internal object ConvertQueue {
         }
     }
 
+    /**
+     * 是否有批量任务进行中（有待处理条目，或当前条正在转）。
+     *
+     * 供菜单点击防重入：批量进行中再点"转文本/转全部"直接拒绝。
+     * 原因：再次点击会 startBatch 清空队列重建，但已下发的转文本任务无法取消——
+     * 旧条目继续转 + 新队列又触发下一条，出现并发转文本（易触发服务端限流），
+     * 且两次扫描的 total/done 计数互相污染。队列排空（或 240s 守卫超时）后自动恢复可点。
+     */
+    fun isActive(): Boolean {
+        synchronized(lock) { return current > 0L || pending.isNotEmpty() }
+    }
+
     /** 入队一条待转 mediaId；若队列空闲则立即开始处理。 */
     fun enqueue(mediaId: Long) {
         synchronized(lock) {
