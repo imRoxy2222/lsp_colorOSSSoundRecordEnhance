@@ -25,13 +25,20 @@ internal object ConvertQueue {
     private val pending = LinkedBlockingDeque<Long>()
     private val lock = Any()
 
-    @Volatile private var current: Long = -1L
-    @Volatile private var guardScheduled = false
-    @Volatile private var activityRef: Activity? = null
-    @Volatile private var trigger: TriggerHandle? = null
+    @Volatile
+    private var current: Long = -1L
+    @Volatile
+    private var guardScheduled = false
+    @Volatile
+    private var activityRef: Activity? = null
+    @Volatile
+    private var trigger: TriggerHandle? = null
 
     private var total = 0
     private var done = 0
+
+    /** 本轮批量里每条已自动重试的次数（空结果重试用）。 */
+    private val attempts = HashMap<Long, Int>()
 
     private val guardRunnable = Runnable {
         synchronized(lock) {
@@ -59,6 +66,7 @@ internal object ConvertQueue {
             guardScheduled = false
             total = 0
             done = 0
+            synchronized(attempts) { attempts.clear() }
             activityRef = activity
             trigger = trig
         }
@@ -90,16 +98,39 @@ internal object ConvertQueue {
     /**
      * 完成回调入口（hook 转文本完成 toast 方法后调用）。
      *
+     * **空结果自动重试**：ASR 任务可能"成功结束但识别结果为空"（弹"录音中未识别到文本"，
+     * 批量连发时因云端限流/本地引擎会话未释放完而明显更频繁；app 此时**不写** convert 记录）。
+     * 所有完成路径都先写库再弹 toast，所以此处用 checkAlreadyConvertComplete 可靠区分：
+     * 未写记录 = 空结果 → 重新入队，冷却 [RETRY_GAP_MS] 后重试，最多 [MAX_ATTEMPTS] 次
+     * （手动重试能成功，说明只是瞬时状态，自动重试即可覆盖）。
+     *
      * @param mediaId 完成的录音 mediaId；<=0 表示无法识别，按"当前条"处理。
      */
     fun onConvertComplete(mediaId: Long) {
         synchronized(lock) {
             if (current <= 0L) return
             if (mediaId > 0L && mediaId != current) return
+            val finished = current
             current = -1L
-            done++
             handler.removeCallbacks(guardRunnable)
             guardScheduled = false
+            // 空结果检测与重试（真实完成路径均先写库后 toast，见方法注释）
+            val converted = if (finished > 0L) (trigger?.isConverted(finished) ?: false) else true
+            if (!converted) {
+                val n = (synchronized(attempts) { attempts[finished] } ?: 0)
+                if (n < MAX_ATTEMPTS) {
+                    synchronized(attempts) { attempts[finished] = n + 1 }
+                    pending.offer(finished)
+                    total++
+                    XLog.w("convert empty result: mediaId=$finished, retry #${n + 1} in ${RETRY_GAP_MS / 1000}s")
+                    toast("第 ${done + 1} 条未识别到文本，稍后自动重试")
+                    handler.postDelayed(drainRunnable, RETRY_GAP_MS)
+                    return
+                }
+                XLog.w("convert empty result: mediaId=$finished, give up after $MAX_ATTEMPTS retries")
+                toast("第 ${done + 1} 条多次未识别到文本，已跳过")
+            }
+            done++
             // 短延迟后转下一条，避免请求过频被服务端限流
             handler.postDelayed(drainRunnable, GAP_MS)
         }
@@ -151,4 +182,10 @@ internal object ConvertQueue {
 
     private const val GAP_MS = 3000L
     private const val GUARD_TIMEOUT_MS = 240_000L
+
+    /** 空结果自动重试的最大次数（首次 + 重试 MAX_ATTEMPTS 次）。 */
+    private const val MAX_ATTEMPTS = 2
+
+    /** 空结果重试的冷却间隔：给云端限流解除 / 本地引擎释放留时间。 */
+    private const val RETRY_GAP_MS = 20_000L
 }
