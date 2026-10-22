@@ -68,6 +68,15 @@ class TriggerHandle(
         }
     }
 
+    /**
+     * 供菜单扫描器预过滤：该 mediaId 是否已转文本完成。
+     * [checkCompleteMethod] 不可用时返回 false（不拦截，由队列兜底跳过）。
+     */
+    fun isConverted(mediaId: Long): Boolean {
+        if (mediaId <= 0L) return false
+        return isAlreadyConverted(mediaId)
+    }
+
     /** 备用 hook 点（SyncCallRecordService.doSync）的 after 回调入口。 */
     fun onUrisSynced(uris: List<Uri>) {
         for (uri in uris) {
