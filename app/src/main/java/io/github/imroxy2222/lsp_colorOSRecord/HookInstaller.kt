@@ -65,6 +65,36 @@ internal const val COL_ID = "_id"
 /** 通话录音的 record_type 值（RecordModeUtil.RECORD_TYPE_SUB_DIR_MAP: 3 = Call Recordings）。 */
 internal const val TYPE_CALL = 3
 
+// ---------------------------------------------------------------- 转写正文搜索索引（search-transcript.md）
+
+/** 转写完成落库口（4 参重载；3 参重载内部转发到它，hook 一个全覆盖）。 */
+internal const val M_UPDATE_COMPLETE_AND_FILE_PATH = "updateCompleteAndFilePathByRecordId"
+
+/** 转写数据删除入口（convert 表 + txt 文件 + 关键词索引一起删）。 */
+internal const val CLS_CONVERT_DELETE_UTIL = "com.soundrecorder.common.db.ConvertDeleteUtil"
+internal const val M_DELETE_CONVERT_DATA = "deleteConvertData"
+
+/** ConvertDbUtil 反查（索引器由 mediaId 找 txt 路径 / 由媒体路径找 recordId）。 */
+internal const val M_SELECT_BY_RECORD_ID = "selectByRecordId"
+internal const val M_SELECT_BY_MEDIA_PATH = "selectByMediaPath"
+internal const val M_GET_CONVERT_TEXTFILE_PATH = "getConvertTextfilePath"
+
+/** 摘要关键字查询（搜索注入点）：17.8.8 的 DAO 封装类与 helper，均为混淆名、跨版本会漂移。 */
+internal const val CLS_SUMMARY_DAO = "com.soundrecorder.summary.request.database.f"
+internal const val CLS_SUMMARY_DB_HELPER = "com.soundrecorder.summary.request.database.b"
+internal const val CLS_SUMMARY_CACHE_ENTITY = "com.soundrecorder.summary.request.database.SummaryCacheEntity"
+
+/** f.b(String) 内的 SQL（dex 常量，全局唯一，DexKit 兜底锚点）。 */
+internal const val ANCHOR_SUMMARY_KEYWORD_QUERY =
+    "SELECT * FROM summary_cache_data WHERE INSTR(summary_content, ?) > 0 AND choose_state = 0"
+
+/** 搜索结果条目 ViewHolder（17.8.8 混淆类名 xg.b）及其绑定方法 D()（browsefile.home.item.h.D 的实现）。 */
+internal const val CLS_ITEM_SEARCH_VIEW = "xg.b"
+internal const val M_BIND_SEARCH_ITEM = "D"
+
+/** xg.b 构造器内注册点击回调的日志串（dex 常量，全局唯一，DexKit 定位兜底）。 */
+internal const val ANCHOR_SEARCH_ITEM_VIEW = "convert click isQuickClick"
+
 /** 全局触发器持有者：ScanButtonInjector 通过它拿 trigger 调用转文本。 */
 internal object TriggerHolder {
     @Volatile
@@ -167,6 +197,13 @@ class HookInstaller(
         installConvertCompleteHooks()
         // 注入一键转文本按钮到通话录音列表界面
         ScanButtonInjector(api, param).install()
+
+        // -------- 转写正文搜索索引（search-transcript.md） --------
+        ConvertIndexer.attachClassLoader(param.classLoader)
+        // 层一：转写完成落库 → 索引该 txt；层二：删除 → 清索引
+        installConvertIndexHooks()
+        // 搜索注入：摘要关键字查询 after-hook 混入转写正文命中
+        SearchInjector(api, param).install()
     }
 
     // ---------------------------------------------------------------- 层1：直接定位
@@ -394,7 +431,11 @@ class HookInstaller(
                 val result = chain.proceed()
                 try {
                     val mid = getMediaId.invoke(chain.thisObject) as? Long ?: -1L
-                    if (mid > 0L) ConvertQueue.onConvertComplete(mid)
+                    if (mid > 0L) {
+                        ConvertQueue.onConvertComplete(mid)
+                        // 转写完成 → 索引正文（转写正文搜索，search-transcript.md §4.1）
+                        ConvertIndexer.scheduleIndexByMediaId(mid)
+                    }
                 } catch (t: Throwable) {
                     XLog.w("FileAsrController.toastAsrComplete after-hook error", t)
                 }
@@ -418,7 +459,10 @@ class HookInstaller(
                 val result = chain.proceed()
                 try {
                     val mid = getMediaId.invoke(chain.thisObject) as? Long ?: -1L
-                    if (mid > 0L) ConvertQueue.onConvertComplete(mid)
+                    if (mid > 0L) {
+                        ConvertQueue.onConvertComplete(mid)
+                        ConvertIndexer.scheduleIndexByMediaId(mid)
+                    }
                 } catch (t: Throwable) {
                     XLog.w("FakeFileAsrController.toastComplete after-hook error", t)
                 }
@@ -444,13 +488,101 @@ class HookInstaller(
                 try {
                     val record = chain.args.getOrNull(0)
                     val mid = if (record != null) getRecordId.invoke(record) as? Long ?: -1L else -1L
-                    if (mid > 0L) ConvertQueue.onConvertComplete(mid)
+                    if (mid > 0L) {
+                        ConvertQueue.onConvertComplete(mid)
+                        ConvertIndexer.scheduleIndexByMediaId(mid)
+                    }
                 } catch (t: Throwable) {
                     XLog.w("ProcessConvert.toastCompletedConvert after-hook error", t)
                 }
                 result
             }
         XLog.i("hooked ${clazz.name}#toastCompletedConvert(ConvertRecord, boolean) [convert-complete]")
+    }
+
+    // ---------------------------------------------------------------- 转写正文搜索索引 hooks
+
+    /**
+     * 索引增量同步 hooks（search-transcript.md §4.1/§4.2）：
+     * - 层一：`ConvertDbUtil.updateCompleteAndFilePathByRecordId(long, String, Boolean, Integer)` —
+     *   转写完成的唯一落库口（3 参重载内部转发到 4 参，hook 一个全覆盖）。after 里
+     *   result==true 且 txt 路径非空 → 投递索引任务（写线程单写者，pending set 去重）；
+     * - 层二：`ConvertDeleteUtil.deleteConvertData(Context, long)` / `(Context, String)` —
+     *   录音删除时同步清索引；漏删场景由首次搜索对账兜底。
+     */
+    private fun installConvertIndexHooks() {
+        val cl = param.classLoader
+        // 层一：转写完成 → 索引
+        try {
+            val clazz = Class.forName(CLS_CONVERT_DB_UTIL, false, cl)
+            val method = clazz.getDeclaredMethod(
+                M_UPDATE_COMPLETE_AND_FILE_PATH,
+                java.lang.Long.TYPE, String::class.java,
+                java.lang.Boolean::class.java, java.lang.Integer::class.java
+            )
+            api.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept { chain ->
+                    val result = chain.proceed()
+                    try {
+                        if (result == true) {
+                            val recordId = chain.args.getOrNull(0) as? Long ?: -1L
+                            val path = chain.args.getOrNull(1) as? String
+                            if (recordId > 0L && !path.isNullOrEmpty()) {
+                                ConvertIndexer.scheduleIndex(recordId, path)
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        XLog.w("updateCompleteAndFilePath after-hook error", t)
+                    }
+                    result
+                }
+            XLog.i("hooked ${clazz.name}#updateCompleteAndFilePathByRecordId(long,String,Boolean,Integer) [index-sync]")
+        } catch (t: Throwable) {
+            XLog.w("updateCompleteAndFilePathByRecordId hook failed: ${t.message}")
+        }
+
+        // 层二：删除 → 清索引
+        try {
+            val clazz = Class.forName(CLS_CONVERT_DELETE_UTIL, false, cl)
+            val ctxType = android.content.Context::class.java
+            val deleteById = clazz.getDeclaredMethod(M_DELETE_CONVERT_DATA, ctxType, java.lang.Long.TYPE)
+            api.hook(deleteById)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept { chain ->
+                    val result = chain.proceed()
+                    try {
+                        val recordId = chain.args.getOrNull(1) as? Long ?: -1L
+                        if (recordId > 0L) ConvertIndexer.scheduleDelete(recordId)
+                    } catch (t: Throwable) {
+                        XLog.w("deleteConvertData(long) after-hook error", t)
+                    }
+                    result
+                }
+            XLog.i("hooked ${clazz.name}#deleteConvertData(Context, long) [index-sync]")
+        } catch (t: Throwable) {
+            XLog.w("deleteConvertData(long) hook failed: ${t.message}")
+        }
+        try {
+            val clazz = Class.forName(CLS_CONVERT_DELETE_UTIL, false, cl)
+            val ctxType = android.content.Context::class.java
+            val deleteByPath = clazz.getDeclaredMethod(M_DELETE_CONVERT_DATA, ctxType, String::class.java)
+            api.hook(deleteByPath)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept { chain ->
+                    val result = chain.proceed()
+                    try {
+                        val mediaPath = chain.args.getOrNull(1) as? String
+                        ConvertIndexer.scheduleDeleteByMediaPath(mediaPath)
+                    } catch (t: Throwable) {
+                        XLog.w("deleteConvertData(String) after-hook error", t)
+                    }
+                    result
+                }
+            XLog.i("hooked ${clazz.name}#deleteConvertData(Context, String) [index-sync]")
+        } catch (t: Throwable) {
+            XLog.w("deleteConvertData(String) hook failed: ${t.message}")
+        }
     }
 }
 
