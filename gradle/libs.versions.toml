@@ -1,0 +1,14 @@
+[versions]
+agp = "9.4.1"
+kotlin = "2.2.10"
+libxposed = "102.0.0"
+dexkit = "2.3.0"
+
+[libraries]
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposed" }
+libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposed" }
+dexkit = { group = "org.luckypray", name = "dexkit", version.ref = "dexkit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

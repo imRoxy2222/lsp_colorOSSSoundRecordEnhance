@@ -1,0 +1,16 @@
+# Add project specific R8 rules here.
+# AGP will combine all keep rule files in src/main/keepRules to pass to R8
+#
+# For more details, see
+#   https://d.android.com/r/tools/r8/keep-rules
+
+# ---- LSPosed 模块入口类保护（libxposed API 102 官方规则）----
+# 入口类名登记在 META-INF/xposed/java_init.list，被混淆/删除会导致模块无法加载
+-dontwarn io.github.libxposed.annotation.**
+-adaptresourcefilecontents META-INF/xposed/java_init.list
+-keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
+    public <init>();
+}
+
+# 保留模块包内所有类（HookInstaller/AudioMonitorHook/TriggerHandle/XLog 等需被入口类引用）
+-keep class io.github.imroxy2222.lsp_colorOSRecord.** { *; }
