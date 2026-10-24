@@ -193,8 +193,9 @@ internal class SearchInjector(
      * app 原生把摘要内容显示为 "摘要：xxx"（xg.b.D() 里 getString(R.string.summary_with_colon) 前缀）。
      * 转写注入条目伪装成摘要走同一条 UI 路径，因此需把标签改回"转文本："。
      *
-     * 做法：hook 搜索条目绑定方法（17.8.8 为 xg.b.D()，无参 void，DexKit 有唯一日志锚点兜底），
-     * after 阶段取 itemView 里的 summary_text TextView：
+     * 做法：hook 搜索条目绑定方法（17.8.8 为 xg.b.D()，无参 void；类名与方法名均为混淆名：
+     * 类由 DexKit 日志锚点兜底，方法由内联资源 id（summary_with_colon）DexKit 兜底，见
+     * [locateSearchItemBind]），after 阶段取 itemView 里的 summary_text TextView：
      * - 文本以"摘要："开头、且内容匹配本次注入片段指纹 → 原地替换前缀为"转文本："
      *   （SpannableStringBuilder 复制后 replace，前缀样式 span 重新铺上，关键词高亮位置随 replace 自动平移）；
      * - 其余情况（真摘要 / 中心搜索结果）一律不动。
@@ -210,7 +211,16 @@ internal class SearchInjector(
             XLog.w("R.id.summary_text not found, transcript label fix disabled")
             return
         }
-        val bindMethod = locateSearchItemBind() ?: run {
+        // summary_with_colon 的资源 id 兼作 bind 方法的 DexKit 锚点（D() 会内联该 id 常量）
+        val summaryPrefixId = resolveRId(
+            param.classLoader,
+            "com.soundrecorder.common.R\$string",
+            "summary_with_colon",
+        ) ?: run {
+            XLog.w("R.string.summary_with_colon not found, transcript label fix disabled")
+            return
+        }
+        val bindMethod = locateSearchItemBind(summaryPrefixId) ?: run {
             XLog.w("search item viewholder bind not found, transcript label fix disabled")
             return
         }
@@ -227,8 +237,14 @@ internal class SearchInjector(
         XLog.i("hooked ${bindMethod.declaringClass.name}#${bindMethod.name}() [transcript-label]")
     }
 
-    /** 定位搜索条目绑定方法：层1 已知混淆名 xg.b#D；层2 DexKit 日志锚点找类再取 D。 */
-    private fun locateSearchItemBind(): Method? {
+    /**
+     * 定位搜索条目绑定方法：
+     * - 类：层1 已知混淆名 xg.b；层2 DexKit 日志锚点 "convert click isQuickClick"（构造器内，全局唯一）；
+     * - 方法：层1 已知混淆名 D；层2 DexKit 按内联资源 id 锚定 —— D() 内联了
+     *   R.string.summary_with_colon 的 id 常量（xg.b 内仅此一处使用），类内该 id +
+     *   无参 + void 的组合唯一（另一个无参 void 方法 x() 是 onRelease，不含该 id）。
+     */
+    private fun locateSearchItemBind(summaryPrefixId: Int): Method? {
         val cl = param.classLoader
         var cls: Class<*>? = try {
             Class.forName(CLS_ITEM_SEARCH_VIEW, false, cl)
@@ -249,12 +265,36 @@ internal class SearchInjector(
             }
         }
         val c = cls ?: return null
-        val m = c.declaredMethods.firstOrNull {
+        // 层1：按已知名 D
+        val byName = c.declaredMethods.firstOrNull {
             !Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
                 it.returnType == Void.TYPE && it.name == M_BIND_SEARCH_ITEM
-        } ?: return null
-        m.isAccessible = true
-        return m
+        }
+        if (byName != null) {
+            byName.isAccessible = true
+            return byName
+        }
+        // 层2：方法名漂移 → 用内联资源 id 兜底（类内唯一）
+        return try {
+            DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
+                val found = bridge.findMethod {
+                    matcher {
+                        declaredClass(c.name)
+                        usingNumbers(summaryPrefixId)
+                        paramCount(0)
+                        returnType("void")
+                    }
+                }
+                XLog.d("dexkit bind method candidates: ${found.size}")
+                found.firstOrNull()?.getMethodInstance(cl)?.also {
+                    it.isAccessible = true
+                    XLog.i("search item bind located (dexkit id-anchor): ${c.name}#${it.name}")
+                }
+            }
+        } catch (t: Throwable) {
+            XLog.w("dexkit bind method locate failed", t)
+            null
+        }
     }
 
     private fun rewriteTranscriptLabel(viewHolder: Any?, summaryTextId: Int) {
