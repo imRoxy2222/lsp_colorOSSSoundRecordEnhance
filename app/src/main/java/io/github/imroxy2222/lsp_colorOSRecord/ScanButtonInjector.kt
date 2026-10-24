@@ -13,7 +13,8 @@ import io.github.libxposed.api.XposedModuleInterface
 import java.lang.reflect.Method
 
 /**
- * 在录音列表（BrowseFragment）右上角展开菜单里注入"转文本"/"转全部"两个菜单项，位于"设置"下方。
+ * 在录音列表（BrowseFragment）右上角展开菜单里注入"转文本"/"转全部"/"生成摘要:开/关"
+ * 三个菜单项，位于"设置"下方。
  *
  * 原理（17.8.8 反编译结论）：
  * - BrowseFragment 工具栏 inflate 的是 R.menu.recorder_list_option_browse，
@@ -29,6 +30,10 @@ import java.lang.reflect.Method
  * - **转全部**：同上但不设上限，把库里所有未转的通话录音全部入队。
  * 扫描在后台线程完成（每条仅 1~2 次 SQLite 查询，无性能压力）；转文本本身由
  * ConvertQueue 串行驱动（完成事件 + 3s 间隔），"转全部"只是队列更长、不更重。
+ *
+ * 另注入开关项 **生成摘要:开/关**（SummaryPrefs 持久化，默认开）：打开时每条
+ * 转文本完成后自动接入 SummaryQueue 生成 AI 摘要（无 UI 走官方 AISummaryTaskManager
+ * 管道，与播放页 tv_start_summary 同链路），串行一条一条生成、条间间隔防云端 QPS 限流。
  *
  * mediaId 用 MediaDBUtils.queryIdByData(路径) 拿 MediaStore _id，
  * 调 trigger.onMediaIdSynced 触发转文本；trigger 内部有 checkAlreadyConvertComplete
@@ -83,6 +88,7 @@ class ScanButtonInjector(
     /**
      * Hook `BrowseFragment.onOptionsItemSelected(MenuItem)`：拦截我们的 itemId，
      * 执行扫描逻辑，不调用原方法（原方法对我们未知 id 本来也只 return true）。
+     * 「生成摘要」项在这里做开关切换，并同步刷新当前菜单里的标题。
      */
     private fun installClickHook() {
         val cl = param.classLoader
@@ -98,23 +104,40 @@ class ScanButtonInjector(
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
             .intercept { chain ->
                 val item = chain.args.getOrNull(0) as? MenuItem
-                val limit = when (item?.itemId) {
-                    MENU_ID_SCAN -> SCAN_LIMIT
-                    MENU_ID_ALL -> Int.MAX_VALUE
-                    else -> 0
-                }
-                if (limit > 0) {
-                    try {
-                        val activity = findFragmentActivity(chain.thisObject)
-                        if (activity != null) {
-                            onScanClicked(activity, limit)
+                when (item?.itemId) {
+                    MENU_ID_SCAN, MENU_ID_ALL -> {
+                        val limit = if (item.itemId == MENU_ID_SCAN) SCAN_LIMIT else Int.MAX_VALUE
+                        try {
+                            val activity = findFragmentActivity(chain.thisObject)
+                            if (activity != null) {
+                                onScanClicked(activity, limit)
+                            }
+                        } catch (t: Throwable) {
+                            XLog.w("scan menu click handler error", t)
                         }
-                    } catch (t: Throwable) {
-                        XLog.w("scan menu click handler error", t)
+                        true
                     }
-                    true
-                } else {
-                    chain.proceed()
+                    MENU_ID_SUMMARY -> {
+                        try {
+                            val activity = findFragmentActivity(chain.thisObject)
+                            if (activity != null) {
+                                val on = SummaryPrefs.toggle(activity)
+                                // MenuItem 实例常驻 Menu，改标题后下次展开菜单也是新状态
+                                item.setTitle(SummaryPrefs.title())
+                                Toast.makeText(
+                                    activity,
+                                    if (on) "转文本完成后自动生成摘要：已开启"
+                                    else "转文本完成后自动生成摘要：已关闭",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                XLog.i("auto summary toggled -> $on")
+                            }
+                        } catch (t: Throwable) {
+                            XLog.w("summary toggle handler error", t)
+                        }
+                        true
+                    }
+                    else -> chain.proceed()
                 }
             }
         XLog.i("hooked BrowseFragment.onOptionsItemSelected(MenuItem) [scan-menu]")
@@ -130,6 +153,8 @@ class ScanButtonInjector(
         }
         if (menuName != MENU_BROWSE) return
 
+        SummaryPrefs.ensureLoaded(toolbar.context)
+
         // COUIToolbar 继承 androidx Toolbar，getMenu() 反射拿 Menu（模块不依赖宿主类）
         val menu = try {
             toolbar.javaClass.getMethod("getMenu").invoke(toolbar) as? Menu
@@ -138,14 +163,22 @@ class ScanButtonInjector(
             null
         } ?: return
 
-        // 防重复注入
-        if (menu.findItem(MENU_ID_SCAN) != null) return
+        // 防重复注入；已注入过时仅刷新摘要开关标题（状态可能被点击切换过）
+        if (menu.findItem(MENU_ID_SCAN) != null) {
+            menu.findItem(MENU_ID_SUMMARY)?.setTitle(SummaryPrefs.title())
+            return
+        }
 
         menu.add(Menu.NONE, MENU_ID_SCAN, ORDER_SCAN, TITLE_SCAN)
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         menu.add(Menu.NONE, MENU_ID_ALL, ORDER_ALL, TITLE_ALL)
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
-        XLog.i("menu items \"$TITLE_SCAN\"/\"$TITLE_ALL\" injected into $menuName")
+        menu.add(Menu.NONE, MENU_ID_SUMMARY, ORDER_SUMMARY, SummaryPrefs.title())
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        XLog.i(
+            "menu items \"$TITLE_SCAN\"/\"$TITLE_ALL\"/\"${SummaryPrefs.title()}\" " +
+                "injected into $menuName"
+        )
     }
 
     /** 从 Fragment 实例反射取宿主 Activity。 */
@@ -289,6 +322,7 @@ class ScanButtonInjector(
          */
         private const val MENU_ID_SCAN = 0x1A2B3C4D
         private const val MENU_ID_ALL = 0x1A2B3C4E
+        private const val MENU_ID_SUMMARY = 0x1A2B3C4F
 
         /**
          * 排序值：XML 内所有 item 的 orderInCategory 均为 0，
@@ -297,5 +331,6 @@ class ScanButtonInjector(
          */
         private const val ORDER_SCAN = 100
         private const val ORDER_ALL = 101
+        private const val ORDER_SUMMARY = 102
     }
 }

@@ -200,6 +200,8 @@ class HookInstaller(
 
         // -------- 转写正文搜索索引（search-transcript.md） --------
         ConvertIndexer.attachClassLoader(param.classLoader)
+        // 摘要队列同样需要宿主 classLoader（懒反射解析 AISummaryTaskManager 管道）
+        SummaryQueue.attachClassLoader(param.classLoader)
         // 层一：转写完成落库 → 索引该 txt；层二：删除 → 清索引
         installConvertIndexHooks()
         // 搜索注入：摘要关键字查询 after-hook 混入转写正文命中
@@ -432,7 +434,7 @@ class HookInstaller(
                 try {
                     val mid = getMediaId.invoke(chain.thisObject) as? Long ?: -1L
                     if (mid > 0L) {
-                        ConvertQueue.onConvertComplete(mid)
+                        onConvertCompleteHooked(mid)
                         // 转写完成 → 索引正文（转写正文搜索，search-transcript.md §4.1）
                         ConvertIndexer.scheduleIndexByMediaId(mid)
                     }
@@ -460,7 +462,7 @@ class HookInstaller(
                 try {
                     val mid = getMediaId.invoke(chain.thisObject) as? Long ?: -1L
                     if (mid > 0L) {
-                        ConvertQueue.onConvertComplete(mid)
+                        onConvertCompleteHooked(mid)
                         ConvertIndexer.scheduleIndexByMediaId(mid)
                     }
                 } catch (t: Throwable) {
@@ -489,7 +491,7 @@ class HookInstaller(
                     val record = chain.args.getOrNull(0)
                     val mid = if (record != null) getRecordId.invoke(record) as? Long ?: -1L else -1L
                     if (mid > 0L) {
-                        ConvertQueue.onConvertComplete(mid)
+                        onConvertCompleteHooked(mid)
                         ConvertIndexer.scheduleIndexByMediaId(mid)
                     }
                 } catch (t: Throwable) {
@@ -501,6 +503,18 @@ class HookInstaller(
     }
 
     // ---------------------------------------------------------------- 转写正文搜索索引 hooks
+
+    /**
+     * 转写完成统一入口（三个完成 hook 共用）：
+     * 1. 先交给 [ConvertQueue]：批量队列消费该事件（返回 true），由队列联动摘要 + 推进下一条；
+     * 2. 队列未消费（无批量 / 手动单条转写完成）且「生成摘要」开关打开 → 独立入摘要队列。
+     */
+    private fun onConvertCompleteHooked(mediaId: Long) {
+        val handled = ConvertQueue.onConvertComplete(mediaId)
+        if (!handled && SummaryPrefs.enabled) {
+            SummaryQueue.enqueue(mediaId)
+        }
+    }
 
     /**
      * 索引增量同步 hooks（search-transcript.md §4.1/§4.2）：

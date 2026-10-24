@@ -47,7 +47,9 @@ internal object ConvertQueue {
                 XLog.d("convert guard timeout for mediaId=$current, force next")
                 current = -1L
                 done++
-                drainNextLocked()
+                // 超时路径不知道转写是否真正成功，不联动摘要；
+                // 但同样等摘要管道空闲后再转下一条（共用云端 QPS）。
+                scheduleNextConvertLocked(GAP_MS)
             }
         }
     }
@@ -84,13 +86,17 @@ internal object ConvertQueue {
         synchronized(lock) { return current > 0L || pending.isNotEmpty() }
     }
 
-    /** 入队一条待转 mediaId；若队列空闲则立即开始处理。 */
+    /**
+     * 入队一条待转 mediaId；若队列空闲则立即开始处理。
+     * 首条触发经由 [SummaryQueue.whenIdle] 节流：摘要管道仍在跑上一轮任务时，
+     * 不与新转写并发打云端。
+     */
     fun enqueue(mediaId: Long) {
         synchronized(lock) {
             pending.offer(mediaId)
             total++
             if (current <= 0L) {
-                drainNextLocked()
+                scheduleNextConvertLocked(GAP_MS)
             }
         }
     }
@@ -104,12 +110,18 @@ internal object ConvertQueue {
      * 未写记录 = 空结果 → 重新入队，冷却 [RETRY_GAP_MS] 后重试，最多 [MAX_ATTEMPTS] 次
      * （手动重试能成功，说明只是瞬时状态，自动重试即可覆盖）。
      *
+     * **摘要联动**（SummaryQueue）：转写最终成功的条目，若「生成摘要」开关打开，
+     * 紧接入摘要队列；下一条转写等摘要管道空闲后才触发 —— 转写/摘要全程共用一条
+     * 云端串行通道，防止 QPS 限流。
+     *
      * @param mediaId 完成的录音 mediaId；<=0 表示无法识别，按"当前条"处理。
+     * @return 是否由本队列消费了该完成事件（true=批量队列的当前条；
+     *         false=队列未在跑 / 完成事件不属于当前条，调用方可据此走独立摘要联动）。
      */
-    fun onConvertComplete(mediaId: Long) {
+    fun onConvertComplete(mediaId: Long): Boolean {
         synchronized(lock) {
-            if (current <= 0L) return
-            if (mediaId > 0L && mediaId != current) return
+            if (current <= 0L) return false
+            if (mediaId > 0L && mediaId != current) return false
             val finished = current
             current = -1L
             handler.removeCallbacks(guardRunnable)
@@ -124,20 +136,31 @@ internal object ConvertQueue {
                     total++
                     XLog.w("convert empty result: mediaId=$finished, retry #${n + 1} in ${RETRY_GAP_MS / 1000}s")
                     toast("第 ${done + 1} 条未识别到文本，稍后自动重试")
-                    handler.postDelayed(drainRunnable, RETRY_GAP_MS)
-                    return
+                    scheduleNextConvertLocked(RETRY_GAP_MS)
+                    return true
                 }
                 XLog.w("convert empty result: mediaId=$finished, give up after $MAX_ATTEMPTS retries")
                 toast("第 ${done + 1} 条多次未识别到文本，已跳过")
             }
             done++
-            // 短延迟后转下一条，避免请求过频被服务端限流
-            handler.postDelayed(drainRunnable, GAP_MS)
+            // 摘要联动：转写成功 → 按开关入摘要队列（SummaryQueue 内部串行 + 条间间隔）
+            if (finished > 0L && SummaryPrefs.enabled) {
+                SummaryQueue.enqueue(finished)
+            }
+            // 短延迟后转下一条；若摘要管道仍在跑，等它空闲再发（共用云端 QPS）
+            scheduleNextConvertLocked(GAP_MS)
+            return true
         }
     }
 
-    /** 取出队首并触发；跳过未真正触发 startConvertTask 的条目（已转/运行中/去重）。 */
+    /**
+     * 取出队首并触发；跳过未真正触发 startConvertTask 的条目（已转/运行中/去重）。
+     *
+     * 已有转写在跑（current>0）时直接返回：批量入队会让 whenIdle 回调重复 postDelayed
+     * 本 runnable，完成回调自会调度下一条，这里不并发触发（防止并发转文本被限流）。
+     */
     private fun drainNextLocked() {
+        if (current > 0L) return
         val trig = trigger ?: return
         while (true) {
             val next = pending.poll()
@@ -170,6 +193,15 @@ internal object ConvertQueue {
         handler.removeCallbacks(guardRunnable)
         guardScheduled = true
         handler.postDelayed(guardRunnable, GUARD_TIMEOUT_MS)
+    }
+
+    /**
+     * 延迟 [delayMs] 后驱动下一条转写；若摘要管道仍在跑（上一条联动摘要或独立摘要），
+     * 先等它空闲再计时 —— 转写与摘要共用一条云端串行通道，防止 QPS 限流。
+     * 必须在持有 [lock] 时调用（命名 Locked）。
+     */
+    private fun scheduleNextConvertLocked(delayMs: Long) {
+        SummaryQueue.whenIdle { handler.postDelayed(drainRunnable, delayMs) }
     }
 
     private fun toast(msg: String) {
