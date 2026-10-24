@@ -21,6 +21,15 @@
 
 批量任务由**事件驱动的串行队列**（`ConvertQueue`）逐条推进：每条转写完成后（Hook 完成回调）延迟 3s 再触发下一条，长录音也会等到真正转完才继续；另设超时保底防止队列卡死。
 
+批量进度通过**系统通知**展示（复用宿主原生"转文本进度"渠道 `convert_text_progress` 与录音机图标，通知栏风格与原生一致，不再逐条弹 toast）：
+
+```
+第一行：转文本中 5/26          ← 批次进度（total>1 时附带整体进度条）
+第二行：xxx.m4a 转写中 / xxx.m4a 生成摘要中
+```
+
+常驻进度通知原位更新；批次全部结束（转写 + 摘要）后发一条可点击清除的完成通知，正文汇总"转文本 N 条 + 摘要 成功/跳过/失败"。通知点击可回到录音机；未授予通知权限时自动回退为 toast。
+
 ### 2. 转写完成后自动生成摘要
 
 与播放页（PlaybackActivity）手动点"生成摘要"走**同一条云端管道**——复用宿主无 UI 的 `AISummaryTaskManager` 投递入口（官方 AI 指令同款路径），结果由宿主自己落库（`files/summary_bundles/bundle_xxx`），模块不碰存储格式。
@@ -78,6 +87,7 @@ ConvertIndexer → FTS 索引
 | `HookInstaller.kt`                            | Hook 安装编排 + DexKit 兜底定位                                                 |
 | `TriggerHandle.kt`                            | 转文本触发器（去重、防重、反射调用）                                            |
 | `ConvertQueue.kt`                             | 完成事件驱动的串行转文本队列                                                    |
+| `BatchNotifier.kt`                            | 批量转写/摘要的系统通知（复用宿主 `convert_text_progress` 渠道，替代 toast）    |
 | `ScanButtonInjector.kt`                       | 注入"转文本 / 转全部 / 生成摘要开关 / 模块诊断"菜单项                           |
 | `HookStatus.kt`                               | Hook 点状态注册表 +「模块诊断」诊断浮层                                         |
 | `SummaryQueue.kt`                             | 转写后自动摘要：开关持久化 + 串行摘要队列（复用宿主 AISummaryTaskManager 管道） |
@@ -119,7 +129,7 @@ ConvertIndexer → FTS 索引
 3. 作用域勾选 **ColorOS 录音机**（`com.coloros.soundrecorder`，模块声明为静态作用域，一般会自动勾选）；
 4. 重启系统界面或重启手机，打开录音机验证。
 
-验证方式：打开录音机后，在 LSPosed 管理器日志中能看到 `module loaded` / `hooked ...` 等日志；点右上角菜单"转文本"后出现逐条"转文本已完成"提示。
+验证方式：打开录音机后，在 LSPosed 管理器日志中能看到 `module loaded` / `hooked ...` 等日志；点右上角菜单"转文本"后，通知栏出现"转文本中 1/N"进度通知并随队列推进原位更新，批次结束后收到"任务完成"通知。
 
 ## 🙋 FAQ
 

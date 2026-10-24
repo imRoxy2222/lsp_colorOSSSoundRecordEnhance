@@ -3,7 +3,6 @@ package io.github.imroxy2222.lsp_colorOSRecord
 import android.app.Activity
 import android.os.Handler
 import android.os.Looper
-import android.widget.Toast
 import java.util.concurrent.LinkedBlockingDeque
 
 /**
@@ -142,12 +141,12 @@ internal object ConvertQueue {
                     pending.offer(finished)
                     total++
                     XLog.w("convert empty result: mediaId=$finished, retry #${n + 1} in ${RETRY_GAP_MS / 1000}s")
-                    toast("第 ${done + 1} 条未识别到文本，稍后自动重试")
+                    BatchNotifier.convertProgress(done + 1, total, finished, "未识别到文本，稍后自动重试")
                     scheduleNextConvertLocked(RETRY_GAP_MS)
                     return true
                 }
                 XLog.w("convert empty result: mediaId=$finished, give up after $MAX_ATTEMPTS retries")
-                toast("第 ${done + 1} 条多次未识别到文本，已跳过")
+                BatchNotifier.convertProgress(done + 1, total, finished, "多次未识别到文本，已跳过")
             }
             done++
             // 摘要联动：转写成功 → 按开关入摘要队列（SummaryQueue 内部串行 + 条间间隔）
@@ -173,8 +172,17 @@ internal object ConvertQueue {
             val next = pending.poll()
             if (next == null) {
                 if (current <= 0L && total > 0 && done >= total) {
-                    toast("批量转文本完成：共 $done 条")
                     XLog.i("convert queue drained: $done item(s)")
+                    val text = "转文本完成：共 $done 条"
+                    BatchNotifier.setConvertSummary(text)
+                    if (SummaryQueue.isActive()) {
+                        // 摘要还在跑：进度通知切到摘要文案，摘要队列排空时统一收尾
+                        // （finish 幂等，摘要侧先到也只发一条完成通知）
+                        BatchNotifier.note("转写完成，正在生成摘要…")
+                        SummaryQueue.whenIdle { BatchNotifier.finish() }
+                    } else {
+                        BatchNotifier.finish()
+                    }
                 }
                 return
             }
@@ -186,7 +194,7 @@ internal object ConvertQueue {
             }
             if (triggered) {
                 current = next
-                toast("正在转文本：第 ${done + 1}/$total 条")
+                BatchNotifier.convertProgress(done + 1, total, next)
                 XLog.d("convert queue: start #$next (${done + 1}/$total)")
                 scheduleGuardLocked()
                 return
@@ -209,14 +217,6 @@ internal object ConvertQueue {
      */
     private fun scheduleNextConvertLocked(delayMs: Long) {
         SummaryQueue.whenIdle { handler.postDelayed(drainRunnable, delayMs) }
-    }
-
-    private fun toast(msg: String) {
-        val act = activityRef
-        handler.post {
-            if (act == null || act.isFinishing || act.isDestroyed) return@post
-            Toast.makeText(act, msg, Toast.LENGTH_SHORT).show()
-        }
     }
 
     private const val GAP_MS = 3000L

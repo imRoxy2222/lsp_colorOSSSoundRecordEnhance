@@ -164,6 +164,8 @@ class HookInstaller(
         ConvertIndexer.attachClassLoader(param.classLoader)
         // 摘要队列：宿主 classLoader + APK 路径（层2 DexKit 定位混淆符号用）
         SummaryQueue.attachClassLoader(param.classLoader, param.applicationInfo.sourceDir)
+        // 批量进度通知：宿主 classLoader（反射取全局 Context / 录音显示名用）
+        BatchNotifier.attachClassLoader(param.classLoader)
         // 层一：转写完成落库 → 索引该 txt；层二：删除 → 清索引
         installConvertIndexHooks()
         // 搜索注入：摘要关键字查询 after-hook 混入转写正文命中

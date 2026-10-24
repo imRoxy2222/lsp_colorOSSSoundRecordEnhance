@@ -291,6 +291,7 @@ class ScanButtonInjector(
                 var skipped = 0
                 cursor?.use { c ->
                     val dataIdx = c.getColumnIndex(COL_DATA)
+                    val nameIdx = c.getColumnIndex(COL_DISPLAY_NAME)
                     while (c.moveToNext()) {
                         val data = if (dataIdx >= 0) c.getString(dataIdx) else null
                         if (data.isNullOrEmpty()) continue
@@ -303,6 +304,10 @@ class ScanButtonInjector(
                         if (mediaId <= 0L) {
                             skipped++
                             continue
+                        }
+                        // 预填通知用显示名缓存，省得通知阶段再反射查库
+                        if (nameIdx >= 0) {
+                            BatchNotifier.cacheName(mediaId, c.getString(nameIdx))
                         }
                         // 已转完的不占名额，继续往更旧的记录找
                         if (trigger.isConverted(mediaId)) {

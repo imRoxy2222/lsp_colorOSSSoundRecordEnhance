@@ -3,7 +3,6 @@ package io.github.imroxy2222.lsp_colorOSRecord
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.widget.Toast
 import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
@@ -224,16 +223,17 @@ internal object SummaryQueue {
 
     private val drainRunnable = Runnable {
         var next: Long = -1L
-        var startToast: String? = null
+        var startIdx = 0
+        var startTotal = 0
+        var finishStats: String? = null
         val idleCbs = mutableListOf<() -> Unit>()
         synchronized(lock) {
             drainScheduled = false
             next = pending.poll() ?: -1L
             if (next <= 0L) {
                 if (total > 0 && done >= total) {
-                    if (total > 1) {
-                        startToast = "摘要全部完成：成功$ok 跳过$skip 失败$fail"
-                    }
+                    finishStats =
+                        if (total > 1) "摘要：成功$ok 跳过$skip 失败$fail" else "摘要完成"
                     total = 0; done = 0; ok = 0; skip = 0; fail = 0
                 }
                 if (current <= 0L && idleCallbacks.isNotEmpty()) {
@@ -242,12 +242,15 @@ internal object SummaryQueue {
                 }
             } else {
                 current = next
-                startToast =
-                    if (total > 1) "正在生成摘要：第 ${done + 1}/$total 条" else "正在生成摘要…"
+                startIdx = done + 1
+                startTotal = total
             }
         }
+        // 先收尾通知（finish 幂等），再放行 idle 回调：转写侧挂起的兜底 finish
+        // 在 finishedRound 保护下不会覆盖本条完成通知
+        if (next <= 0L) finishStats?.let { BatchNotifier.finish(it) }
+        else BatchNotifier.summaryProgress(next, startIdx, startTotal)
         idleCbs.forEach { runCatching { it() } }
-        startToast?.let { toast(it) }
         if (next > 0L) {
             Thread { processItem(next) }.apply {
                 isDaemon = true
@@ -413,21 +416,15 @@ internal object SummaryQueue {
 
     /** 单条结果落账 + 驱动下一条（间隔 [GAP_MS]，防止 QPS 限流）。 */
     private fun settle(mediaId: Long, kind: String, detail: String?) {
-        var msg: String? = null
+        var outcome: String? = null
         val idleCbs = mutableListOf<() -> Unit>()
         synchronized(lock) {
             current = -1L
             done++
             when (kind) {
-                "ok" -> ok++
-                "skip" -> skip++
-                else -> fail++
-            }
-            val pos = if (total > 1) "：第 $done/$total 条" else ""
-            msg = when (kind) {
-                "ok" -> "摘要生成完成$pos"
-                "skip" -> "摘要跳过（$detail）$pos"
-                else -> "摘要失败($detail)$pos"
+                "ok" -> { ok++; outcome = "摘要完成" }
+                "skip" -> { skip++; outcome = "摘要跳过（$detail）" }
+                else -> { fail++; outcome = "摘要失败($detail)" }
             }
             if (pending.isNotEmpty()) {
                 drainScheduled = true
@@ -437,13 +434,13 @@ internal object SummaryQueue {
                 idleCallbacks.clear()
             }
         }
-        msg?.let { toast(it) }
+        outcome?.let { BatchNotifier.summarySettled(done, total, it) }
         idleCbs.forEach { runCatching { it() } }
     }
 
     /** 管道忙重试：冷却 [RETRY_GAP_MS] 后重新入队；超过 [MAX_ATTEMPTS] 次按失败落账。 */
     private fun retryOrGiveUp(mediaId: Long) {
-        var msg: String? = null
+        var outcome: String? = null
         val idleCbs = mutableListOf<() -> Unit>()
         synchronized(lock) {
             current = -1L
@@ -455,11 +452,11 @@ internal object SummaryQueue {
                 total++
                 drainScheduled = true
                 handler.postDelayed(drainRunnable, RETRY_GAP_MS)
-                msg = "摘要请求受限，稍后自动重试（第 ${n + 1} 次）"
+                outcome = "受限，稍后自动重试（第 ${n + 1} 次）"
             } else {
                 synchronized(attemptsLock) { attempts.remove(mediaId) }
                 fail++
-                msg = if (total > 1) "摘要失败：第 $done/$total 条" else "摘要生成失败"
+                outcome = "摘要失败"
                 if (pending.isNotEmpty()) {
                     drainScheduled = true
                     handler.postDelayed(drainRunnable, GAP_MS)
@@ -469,7 +466,7 @@ internal object SummaryQueue {
                 }
             }
         }
-        msg?.let { toast(it) }
+        outcome?.let { BatchNotifier.summarySettled(done, total, it) }
         idleCbs.forEach { runCatching { it() } }
     }
 
@@ -658,18 +655,6 @@ internal object SummaryQueue {
     }
 
     // ------------------------------------------------------------ 杂项
-
-    private fun toast(msg: String) {
-        handler.post {
-            try {
-                // 首条开始 toast 可能先于 worker 的 resolve()，这里懒解析一次拿 Context
-                val ctx = resolve()?.ctx() ?: return@post
-                SummaryPrefs.ensureLoaded(ctx)
-                Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
-            } catch (_: Throwable) {
-            }
-        }
-    }
 
     private const val GAP_MS = 5000L
 
