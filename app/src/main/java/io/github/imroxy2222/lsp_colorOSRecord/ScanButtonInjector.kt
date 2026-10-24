@@ -26,8 +26,9 @@ import java.lang.reflect.Method
  *   被该协程覆盖（repeatOnLifecycle 每次 RESUMED 都会重设），也仍会走到这里。
  *
  * 两个菜单项：
- * - **转文本**：扫通话录音（record_type==3，最新优先），跳过已转完的，取最多 10 条未转的批量触发；
- * - **转全部**：同上但不设上限，把库里所有未转的通话录音全部入队。
+ * - **转文本**：扫全部录音（最新优先，含标准/会议/采访/通话等全部类型，排除回收站），
+ *   跳过已转完的，取最多 10 条未转的批量触发；
+ * - **转全部**：同上但不设上限，把库里所有未转的录音全部入队。
  * 扫描在后台线程完成（每条仅 1~2 次 SQLite 查询，无性能压力）；转文本本身由
  * ConvertQueue 串行驱动（完成事件 + 3s 间隔），"转全部"只是队列更长、不更重。
  *
@@ -201,11 +202,18 @@ class ScanButtonInjector(
     private var scanning = false
 
     /**
-     * 扫描通话录音并批量入队转文本。
+     * 扫描全部录音并批量入队转文本。
      *
-     * 从最新往旧遍历 record_type==3 的录音，**跳过已转完的**（ConvertDbUtil.checkAlreadyConvertComplete），
-     * 只把未转的入队，凑满 [limit] 条即停（转全部时 [limit]=Int.MAX_VALUE 不停）。
+     * 从最新往旧遍历所有录音（record_type IN (0,1,2,3,5,6,7)，即官方
+     * RecordModeConstant.ALL_RECORD_TYPE_LIST 的全部类型：标准/会议/采访/通话/
+     * 其他/互传/手表；排除回收站 is_recycle=0），**跳过已转完的**
+     * （ConvertDbUtil.checkAlreadyConvertComplete），只把未转的入队，
+     * 凑满 [limit] 条即停（转全部时 [limit]=Int.MAX_VALUE 不停）。
      * 这样"转文本"拿到的一定是最新 10 条**未转**的，而不是"最新 10 条里恰好没转过"的。
+     *
+     * 转文本管道（startConvertTask → FileAsrController）对所有类型通用：
+     * 官方 ConvertSupportManager.isSupportConvert 只做设备能力检查，不限 record_type，
+     * 播放页对标准/会议录音同样提供"转文本"按钮。
      */
     private fun onScanClicked(activity: Activity, limit: Int) {
         val trigger = TriggerHolder.trigger
@@ -224,7 +232,7 @@ class ScanButtonInjector(
         val convertAll = limit == Int.MAX_VALUE
         Toast.makeText(
             activity,
-            if (convertAll) "开始扫描全部通话录音…" else "开始扫描通话录音…",
+            if (convertAll) "开始扫描全部录音…" else "开始扫描录音…",
             Toast.LENGTH_SHORT
         ).show()
         Thread {
@@ -241,8 +249,10 @@ class ScanButtonInjector(
                 val cursor = resolver.query(
                     queryUri,
                     arrayOf(COL_DATA, COL_DISPLAY_NAME),
-                    "$COL_RECORD_TYPE = ?",
-                    arrayOf(TYPE_CALL.toString()),
+                    // 全部录音类型（官方 ALL_RECORD_TYPE_LIST）+ 排除回收站；
+                    // Provider 的 query 把 selection 直接透传给 SQLite（无内置过滤）
+                    "$COL_RECORD_TYPE IN ($SQL_ALL_RECORD_TYPES) AND $COL_IS_RECYCLE = 0",
+                    null,
                     "$COL_ID DESC"
                 )
                 // 开启一轮批量：清空旧队列，绑定上下文；队列内部逐条驱动，
@@ -286,7 +296,7 @@ class ScanButtonInjector(
                 XLog.i(msg)
                 if (enqueued == 0) {
                     Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(activity, "没有需要转文本的通话录音", Toast.LENGTH_LONG).show()
+                        Toast.makeText(activity, "没有需要转文本的录音", Toast.LENGTH_LONG).show()
                     }
                 }
                 // 队列自行驱动后续条目，无需在此 sleep
@@ -300,7 +310,7 @@ class ScanButtonInjector(
             }
         }.apply {
             isDaemon = true
-            name = "CallRecConvert-Scan"
+            name = "RecConvert-Scan"
         }.start()
     }
 
@@ -312,6 +322,15 @@ class ScanButtonInjector(
         private const val MENU_BROWSE = "recorder_list_option_browse"
         private const val TITLE_SCAN = "转文本"
         private const val TITLE_ALL = "转全部"
+
+        /**
+         * 扫描覆盖的全部录音类型，即官方 RecordModeConstant.ALL_RECORD_TYPE_LIST：
+         * 0=标准 1=会议 2=采访 3=通话 5=其他 6=互传 7=手表。
+         */
+        private const val SQL_ALL_RECORD_TYPES = "0,1,2,3,5,6,7"
+
+        /** 回收站标记列（DatabaseConstant.RecorderColumn.COLUMN_NAME_IS_RECYCLE），扫描时排除。 */
+        private const val COL_IS_RECYCLE = "is_recycle"
 
         /** "转文本"：跳过已转后最多入队条数。 */
         private const val SCAN_LIMIT = 10
