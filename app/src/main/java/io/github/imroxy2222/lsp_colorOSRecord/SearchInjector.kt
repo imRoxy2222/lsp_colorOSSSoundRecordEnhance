@@ -76,6 +76,7 @@ internal class SearchInjector(
             val daoCls = Class.forName(CLS_SUMMARY_DAO, false, cl)
             findKeywordQuery(daoCls)?.let {
                 XLog.i("summary dao located (layer1a): ${daoCls.name}")
+                HookStatus.found("search_dao", "层1a", "实际: ${daoCls.name}")
                 return it
             }
         } catch (t: Throwable) {
@@ -93,6 +94,7 @@ internal class SearchInjector(
                 if (instance != null) {
                     findKeywordQuery(instance.javaClass)?.let {
                         XLog.i("summary dao located (layer1b): ${instance.javaClass.name}")
+                        HookStatus.found("search_dao", "层1b", "实际: ${instance.javaClass.name}")
                         return it
                     }
                 }
@@ -115,9 +117,11 @@ internal class SearchInjector(
                     }
                     if (m.parameterTypes.size == 1 && m.parameterTypes[0] == String::class.java) {
                         XLog.i("summary dao located (dexkit): ${data.className}#${data.name}")
+                        HookStatus.found("search_dao", "DexKit", "实际: ${data.className}")
                         return m
                     }
                 }
+                HookStatus.missing("search_dao", "层1a/1b/DexKit 均未定位，转写搜索失效")
                 null
             }
         } catch (t: Throwable) {
@@ -222,7 +226,15 @@ internal class SearchInjector(
         }
         val bindMethod = locateSearchItemBind(summaryPrefixId) ?: run {
             XLog.w("search item viewholder bind not found, transcript label fix disabled")
+            HookStatus.missing("search_bind", "定位失败（注入条目会显示为\"摘要：\"前缀，功能不受影响）")
             return
+        }
+        // 结果伪装依赖 SummaryCacheEntity 23 参构造（安装时探测一次并上报）
+        val ctorProbe = entityConstructor()
+        if (ctorProbe != null) {
+            HookStatus.found("search_entity", "层1", "实际: ${ctorProbe.declaringClass.name}")
+        } else {
+            HookStatus.missing("search_entity", "23 参构造未找到（转写搜索注入失效）")
         }
         api.hook(bindMethod)
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -264,7 +276,10 @@ internal class SearchInjector(
                 null
             }
         }
-        val c = cls ?: return null
+        val c = cls ?: run {
+            HookStatus.missing("search_bind", "类未定位（xg.b 名称漂移且日志锚点失效）")
+            return null
+        }
         // 层1：按已知名 D
         val byName = c.declaredMethods.firstOrNull {
             !Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
@@ -272,6 +287,7 @@ internal class SearchInjector(
         }
         if (byName != null) {
             byName.isAccessible = true
+            HookStatus.found("search_bind", "层1", "实际: ${c.name}#${byName.name}")
             return byName
         }
         // 层2：方法名漂移 → 用内联资源 id 兜底（类内唯一）
@@ -289,10 +305,15 @@ internal class SearchInjector(
                 found.firstOrNull()?.getMethodInstance(cl)?.also {
                     it.isAccessible = true
                     XLog.i("search item bind located (dexkit id-anchor): ${c.name}#${it.name}")
+                    HookStatus.found("search_bind", "DexKit(id 锚点)", "实际: ${c.name}#${it.name}")
+                } ?: run {
+                    HookStatus.missing("search_bind", "id 锚点未命中（方法签名可能变化）")
+                    null
                 }
             }
         } catch (t: Throwable) {
             XLog.w("dexkit bind method locate failed", t)
+            HookStatus.missing("search_bind", "DexKit 定位异常: ${t.message}")
             null
         }
     }

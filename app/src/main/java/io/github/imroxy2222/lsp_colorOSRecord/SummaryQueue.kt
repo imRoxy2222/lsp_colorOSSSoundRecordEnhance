@@ -547,10 +547,16 @@ internal object SummaryQueue {
             if (r == null) {
                 XLog.w("summary engine resolve failed (layer1 + dexkit), summary disabled")
                 resolveFailed = true
+                HookStatus.missing("summary_pipe", "层1 + DexKit 均未定位到摘要管道，摘要功能停用")
                 null
             } else {
                 resolved = r
                 XLog.i("summary engine resolved via ${r.source}")
+                HookStatus.found(
+                    "summary_pipe",
+                    if (r.source.startsWith("layer1")) "层1" else "DexKit",
+                    "摘要管道已就绪"
+                )
                 r
             }
         }
@@ -568,6 +574,22 @@ internal object SummaryQueue {
             common = common,
             obf = obf
         )
+    }
+
+    /** 摘要管道是懒解析（首次用到才 resolve）：状态面板打开时后台触发一次，把定位结果上报到面板。 */
+    fun prefetchResolveAsync() {
+        Thread {
+            runCatching { resolve() }
+        }.apply {
+            isDaemon = true
+            name = "SummaryQueue-Prefetch"
+        }.start()
+    }
+
+    /** 队列运行状态（状态面板用）。 */
+    fun statusText(): String = synchronized(lock) {
+        if (current <= 0L && pending.isEmpty() && !drainScheduled) "空闲"
+        else "进行中：待处理 ${pending.size}" + (if (current > 0L) "，当前条生成中" else "，间隔/冷却中")
     }
 
     /** 未混淆符号解析：任何一项缺失都整体失败（这些名字不混淆，失败说明版本大改）。 */
@@ -594,9 +616,10 @@ internal object SummaryQueue {
                 getDuration = recordCls.getMethod("getDuration"),
                 getCallName = recordCls.getMethod("getCallName"),
                 getData = recordCls.getMethod("getData")
-            )
+            ).also { HookStatus.found("summary_common", "层1", "公共依赖就绪") }
         } catch (t: Throwable) {
             XLog.w("summary common deps resolve failed: ${t.message}")
+            HookStatus.missing("summary_common", t.message ?: "公共依赖反射失败")
             null
         }
     }

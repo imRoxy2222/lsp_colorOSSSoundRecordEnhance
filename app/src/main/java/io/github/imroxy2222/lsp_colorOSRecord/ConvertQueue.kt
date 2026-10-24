@@ -86,6 +86,13 @@ internal object ConvertQueue {
         synchronized(lock) { return current > 0L || pending.isNotEmpty() }
     }
 
+    /** 队列运行状态（状态面板用）。 */
+    fun statusText(): String = synchronized(lock) {
+        if (current <= 0L && pending.isEmpty()) "空闲"
+        else "进行中：已完成 $done/$total，待处理 ${pending.size}" +
+            (if (current > 0L) "，当前条转写中" else "，条间间隔中")
+    }
+
     /**
      * 入队一条待转 mediaId；若队列空闲则立即开始处理。
      * 首条触发经由 [SummaryQueue.whenIdle] 节流：摘要管道仍在跑上一轮任务时，

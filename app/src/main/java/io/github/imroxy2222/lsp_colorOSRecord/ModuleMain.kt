@@ -18,6 +18,10 @@ class ModuleMain : XposedModule() {
 
     override fun onModuleLoaded(param: XposedModuleInterface.ModuleLoadedParam) {
         XLog.attach(this)
+        // 状态面板需要模块自身版本（模块运行在宿主进程，宿主包管理器不认识模块包名）
+        runCatching { ModuleInfo.appInfo = moduleApplicationInfo }
+        // 触发 HookStatus 注册表初始化（登记全部 hook 点条目）
+        runCatching { HookStatus.snapshot() }
         XLog.i(
             "module loaded: process=${param.processName}, " +
                 "framework=$frameworkName($frameworkVersionCode), api=$apiVersion"

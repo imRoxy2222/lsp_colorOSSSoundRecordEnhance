@@ -114,6 +114,9 @@ class HookInstaller(
         // ---------- 层1：未混淆类名直接定位 trigger ----------
         var trigger = resolveTriggerDirect(cl)
         XLog.d("layer1: trigger=${trigger != null}")
+        if (trigger != null) {
+            HookStatus.found("trigger", "层1", "触发器就绪")
+        }
 
         if (trigger == null) {
             // ---------- 层2：DexKit 兜底（后台线程，避免阻塞 App 启动） ----------
@@ -126,6 +129,12 @@ class HookInstaller(
                     }
                 } catch (t: Throwable) {
                     XLog.w("dexkit fallback failed", t)
+                    HookStatus.missing("trigger", "DexKit 定位异常: ${t.message}")
+                }
+                if (resolved != null) {
+                    HookStatus.found("trigger", "DexKit", "触发器就绪（层1失败后兜底定位）")
+                } else if (HookStatus.snapshot().first { it.id == "trigger" }.state == HookStatus.State.PENDING) {
+                    HookStatus.missing("trigger", "层1 + DexKit 均未定位到 startConvertTask")
                 }
                 finishInstall(resolved)
             }.apply {
@@ -140,6 +149,7 @@ class HookInstaller(
     private fun finishInstall(trigger: TriggerHandle?) {
         if (trigger == null) {
             XLog.w("trigger unresolved, module inactive")
+            HookStatus.missing("trigger", "触发器未定位，模块整体失效")
             return
         }
 
@@ -186,8 +196,10 @@ class HookInstaller(
         return try {
             Class.forName(CLS_CONVERT_DB_UTIL, false, cl)
                 .getMethod(M_CHECK_ALREADY_CONVERT_COMPLETE, java.lang.Long.TYPE)
+                .also { HookStatus.found("check_complete", "层1") }
         } catch (t: Throwable) {
             XLog.d("layer1 checkAlreadyConvertComplete not found: ${t.message}")
+            HookStatus.optionalMissing("check_complete", t.message)
             null
         }
     }
@@ -197,9 +209,11 @@ class HookInstaller(
             val clazz = Class.forName(CLS_CONVERT_TASK_THREAD_MANAGER, false, cl)
             val instance = clazz.getField(F_INSTANCE).get(null) ?: return null
             val method = clazz.getMethod(M_CHECK_IS_TASK_RUNNING, java.lang.Long.TYPE)
+            HookStatus.found("check_running", "层1")
             instance to method
         } catch (t: Throwable) {
             XLog.d("layer1 checkIsTaskRunning not found: ${t.message}")
+            HookStatus.optionalMissing("check_running", t.message)
             null
         }
     }
@@ -229,8 +243,10 @@ class HookInstaller(
         val (clazz, method, getMediaId) = try {
             val c = Class.forName(CLS_FILE_ASR_CONTROLLER, false, cl)
             Triple(c, c.getDeclaredMethod(M_TOAST_ASR_COMPLETE, java.lang.Boolean.TYPE), c.getMethod(M_GET_MEDIA_ID))
+                .also { HookStatus.found("complete_asr", "层1", "实际: ${c.name}") }
         } catch (t: Throwable) {
             XLog.d("FileAsrController.toastAsrComplete not found: ${t.message}")
+            HookStatus.missing("complete_asr", "定位失败: ${t.message}（在线/本地链路完成事件丢失）")
             return
         }
         api.hook(method)
@@ -257,8 +273,10 @@ class HookInstaller(
         val (clazz, method, getMediaId) = try {
             val c = Class.forName(CLS_FAKE_FILE_ASR_CONTROLLER, false, cl)
             Triple(c, c.getDeclaredMethod(M_TOAST_COMPLETE), c.getMethod(M_GET_MEDIA_ID))
+                .also { HookStatus.found("complete_fake", "层1", "实际: ${c.name}") }
         } catch (t: Throwable) {
             XLog.d("FakeFileAsrController.toastComplete not found: ${t.message}")
+            HookStatus.missing("complete_fake", "定位失败: ${t.message}（降级链路完成事件丢失）")
             return
         }
         api.hook(method)
@@ -285,8 +303,10 @@ class HookInstaller(
             val c = Class.forName(CLS_PROCESS_CONVERT, false, cl)
             val recordCls = Class.forName(CLS_CONVERT_RECORD, false, cl)
             Triple(c, c.getDeclaredMethod(M_TOAST_COMPLETED_CONVERT, recordCls, java.lang.Boolean.TYPE), recordCls.getMethod(M_GET_RECORD_ID))
+                .also { HookStatus.found("complete_proc", "层1", "实际: ${c.name}") }
         } catch (t: Throwable) {
             XLog.d("ProcessConvert.toastCompletedConvert not found: ${t.message}")
+            HookStatus.missing("complete_proc", "定位失败: ${t.message}（后台进程完成事件丢失）")
             return
         }
         api.hook(method)
@@ -358,8 +378,10 @@ class HookInstaller(
                     result
                 }
             XLog.i("hooked ${clazz.name}#updateCompleteAndFilePathByRecordId(long,String,Boolean,Integer) [index-sync]")
+            HookStatus.found("index_update", "层1", "实际: ${clazz.name}")
         } catch (t: Throwable) {
             XLog.w("updateCompleteAndFilePathByRecordId hook failed: ${t.message}")
+            HookStatus.missing("index_update", "定位失败: ${t.message}（转写正文搜索会退化为仅对账）")
         }
 
         // 层二：删除 → 清索引
@@ -380,8 +402,10 @@ class HookInstaller(
                     result
                 }
             XLog.i("hooked ${clazz.name}#deleteConvertData(Context, long) [index-sync]")
+            HookStatus.found("index_del_id", "层1", "实际: ${clazz.name}")
         } catch (t: Throwable) {
             XLog.w("deleteConvertData(long) hook failed: ${t.message}")
+            HookStatus.optionalMissing("index_del_id", "定位失败: ${t.message}（删除后索引靠对账兜底）")
         }
         try {
             val clazz = Class.forName(CLS_CONVERT_DELETE_UTIL, false, cl)
@@ -400,8 +424,10 @@ class HookInstaller(
                     result
                 }
             XLog.i("hooked ${clazz.name}#deleteConvertData(Context, String) [index-sync]")
+            HookStatus.found("index_del_path", "层1", "实际: ${clazz.name}")
         } catch (t: Throwable) {
             XLog.w("deleteConvertData(String) hook failed: ${t.message}")
+            HookStatus.optionalMissing("index_del_path", "定位失败: ${t.message}（删除后索引靠对账兜底）")
         }
     }
 }

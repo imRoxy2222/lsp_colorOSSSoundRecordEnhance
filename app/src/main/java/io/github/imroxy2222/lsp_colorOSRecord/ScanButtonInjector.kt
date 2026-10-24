@@ -14,7 +14,7 @@ import java.lang.reflect.Method
 
 /**
  * 在录音列表（BrowseFragment）右上角展开菜单里注入"转文本"/"转全部"/"生成摘要:开/关"
- * 三个菜单项，位于"设置"下方。
+ * /"模块诊断"四个菜单项，位于"设置"下方。
  *
  * 原理（17.8.8 反编译结论）：
  * - BrowseFragment 工具栏 inflate 的是 R.menu.recorder_list_option_browse，
@@ -35,6 +35,9 @@ import java.lang.reflect.Method
  * 另注入开关项 **生成摘要:开/关**（SummaryPrefs 持久化，默认开）：打开时每条
  * 转文本完成后自动接入 SummaryQueue 生成 AI 摘要（无 UI 走官方 AISummaryTaskManager
  * 管道，与播放页 tv_start_summary 同链路），串行一条一条生成、条间间隔防云端 QPS 限流。
+ *
+ * 以及 **模块诊断**：打开 HookStatus 诊断浮层（宿主/模块版本、各 hook 点定位状态、
+ * 队列运行状态，支持复制文本），模块失效时用户截图即可快速定位漂移的符号。
  *
  * mediaId 用 MediaDBUtils.queryIdByData(路径) 拿 MediaStore _id，
  * 调 trigger.onMediaIdSynced 触发转文本；trigger 内部有 checkAlreadyConvertComplete
@@ -66,6 +69,7 @@ class ScanButtonInjector(
                 .getDeclaredMethod("inflateMenu", Int::class.javaPrimitiveType)
         } catch (t: Throwable) {
             XLog.w("COUIToolbar.inflateMenu not found: ${t.message}")
+            HookStatus.missing("menu_toolbar", "定位失败: ${t.message}（菜单功能整体失效）")
             return
         }
 
@@ -84,6 +88,7 @@ class ScanButtonInjector(
                 result
             }
         XLog.i("hooked COUIToolbar.inflateMenu(int) [scan-menu]")
+        HookStatus.found("menu_toolbar", "层1", "实际: ${method.declaringClass.name}")
     }
 
     /**
@@ -98,6 +103,7 @@ class ScanButtonInjector(
                 .getDeclaredMethod("onOptionsItemSelected", MenuItem::class.java)
         } catch (t: Throwable) {
             XLog.w("BrowseFragment.onOptionsItemSelected not found: ${t.message}")
+            HookStatus.missing("menu_click", "定位失败: ${t.message}（菜单点击无响应）")
             return
         }
 
@@ -118,6 +124,7 @@ class ScanButtonInjector(
                         }
                         true
                     }
+
                     MENU_ID_SUMMARY -> {
                         try {
                             val activity = findFragmentActivity(chain.thisObject)
@@ -138,9 +145,23 @@ class ScanButtonInjector(
                         }
                         true
                     }
+
+                    MENU_ID_SETTINGS -> {
+                        try {
+                            val activity = findFragmentActivity(chain.thisObject)
+                            if (activity != null) {
+                                HookStatus.showPanel(activity)
+                            }
+                        } catch (t: Throwable) {
+                            XLog.w("status panel open error", t)
+                        }
+                        true
+                    }
+
                     else -> chain.proceed()
                 }
             }
+        HookStatus.found("menu_click", "层1", "实际: ${method.declaringClass.name}")
         XLog.i("hooked BrowseFragment.onOptionsItemSelected(MenuItem) [scan-menu]")
     }
 
@@ -176,9 +197,15 @@ class ScanButtonInjector(
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
         menu.add(Menu.NONE, MENU_ID_SUMMARY, ORDER_SUMMARY, SummaryPrefs.title())
             .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        menu.add(Menu.NONE, MENU_ID_SETTINGS, ORDER_SETTINGS, TITLE_SETTINGS)
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+        HookStatus.found(
+            "menu_items", "运行时",
+            "菜单项 x4 已注入（转文本/转全部/${SummaryPrefs.title()}/模块诊断）"
+        )
         XLog.i(
-            "menu items \"$TITLE_SCAN\"/\"$TITLE_ALL\"/\"${SummaryPrefs.title()}\" " +
-                "injected into $menuName"
+            "menu items \"$TITLE_SCAN\"/\"$TITLE_ALL\"/\"${SummaryPrefs.title()}\"/\"$TITLE_SETTINGS\" " +
+                    "injected into $menuName"
         )
     }
 
@@ -322,6 +349,7 @@ class ScanButtonInjector(
         private const val MENU_BROWSE = "recorder_list_option_browse"
         private const val TITLE_SCAN = "转文本"
         private const val TITLE_ALL = "转全部"
+        private const val TITLE_SETTINGS = "模块诊断"
 
         /**
          * 扫描覆盖的全部录音类型，即官方 RecordModeConstant.ALL_RECORD_TYPE_LIST：
@@ -342,6 +370,7 @@ class ScanButtonInjector(
         private const val MENU_ID_SCAN = 0x1A2B3C4D
         private const val MENU_ID_ALL = 0x1A2B3C4E
         private const val MENU_ID_SUMMARY = 0x1A2B3C4F
+        private const val MENU_ID_SETTINGS = 0x1A2B3C50
 
         /**
          * 排序值：XML 内所有 item 的 orderInCategory 均为 0，
@@ -351,5 +380,6 @@ class ScanButtonInjector(
         private const val ORDER_SCAN = 100
         private const val ORDER_ALL = 101
         private const val ORDER_SUMMARY = 102
+        private const val ORDER_SETTINGS = 103
     }
 }
