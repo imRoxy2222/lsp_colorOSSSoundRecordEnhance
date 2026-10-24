@@ -36,7 +36,7 @@ internal const val F_DEFAULT_THEME_KEY = "KEY_DEFAULT_SUMMARY_THEME_CODE"
 internal const val M_GET_INT = "getInt"
 internal const val M_APP_CONTEXT = "getAppContext"
 
-/** q 的静态方法（单字母名，跨版本可能漂移；全部 try-catch 兜底）。 */
+/** q 的静态方法（单字母名，层1按 17.8.8 已知名，层2 DexKit 按锚点兜底，见 SummaryDexKitResolver）。 */
 internal const val M_SUMMARY_REG_CALLBACK = "g"    // g(long, u) 注册事件回调
 internal const val M_SUMMARY_POST = "h"            // h(SummaryRequestModel) 投递任务，返回是否受理
 internal const val M_SUMMARY_UNREG_CALLBACK = "i"  // i(long, u) 注销回调
@@ -127,8 +127,14 @@ internal object SummaryPrefs {
  *
  * **与 ConvertQueue 的协同**：ConvertQueue 每条转写成功后把 mediaId 交到这里，
  * 并通过 [whenIdle] 等摘要管道空闲后才触发下一条转写 —— 转写与摘要全程共用一条云端
- * 串行通道，避免 QPS 限流。独立转写（无批量队列，如入库自动转）完成时由
- * HookInstaller 的完成回调直接入队本队列。
+ * 串行通道，避免 QPS 限流。独立转写（无批量队列）完成时由 HookInstaller 的完成回调
+ * 直接入队本队列。
+ *
+ * **两层定位**：摘要管道的核心类/方法（AISummaryTaskManager 的 g/h/i/b、回调接口 u、
+ * 请求模型、缓存 DAO）在宿主里是单字母混淆名，跨版本会漂移。层1 按 17.8.8 已知名直接
+ * 反射；层2 失败时用 DexKit 按日志串/SQL 串锚点 + 构造器签名重定位
+ * （见 [SummaryDexKitResolver]），结果进程内缓存 —— 每进程至多解析一次，且层2 仅在
+ * 层1 失败时才启动，正常路径零额外开销。两层都失败则摘要功能降级关闭，不影响转文本。
  */
 internal object SummaryQueue {
 
@@ -159,15 +165,20 @@ internal object SummaryQueue {
     @Volatile
     private var classLoader: ClassLoader? = null
 
+    /** 宿主 APK 路径（层2 DexKit 定位用，可为 null = 不启用层2）。 */
+    @Volatile
+    private var apkPath: String? = null
+
     @Volatile
     private var resolved: Resolved? = null
 
     @Volatile
     private var resolveFailed = false
 
-    /** 与 ConvertIndexer 同款：从 HookInstaller 传入宿主 classLoader。 */
-    fun attachClassLoader(cl: ClassLoader) {
+    /** 与 ConvertIndexer 同款：从 HookInstaller 传入宿主 classLoader 与 APK 路径。 */
+    fun attachClassLoader(cl: ClassLoader, apkPath: String? = null) {
         classLoader = cl
+        if (apkPath != null) this.apkPath = apkPath
     }
 
     // ------------------------------------------------------------ 对外入口
@@ -462,18 +473,13 @@ internal object SummaryQueue {
         idleCbs.forEach { runCatching { it() } }
     }
 
-    // ------------------------------------------------------------ 反射解析（懒加载，失败不再重试）
+    // ------------------------------------------------------------ 反射解析（懒加载 + 两层定位）
 
-    internal class Resolved(
-        val uClass: Class<*>,
-        val register: Method,
-        val unregister: Method,
-        val post: Method,
-        val cancel: Method,
-        val cacheGet: Method,
+    /** 未混淆符号（Kotlin 业务类保留原名，跨版本稳定；层1/层2 共用）。 */
+    internal class CommonDeps(
         val checkConvertComplete: Method,
         val queryRecordById: Method,
-        val modelCtor: Constructor<*>,
+        val themeCls: Class<*>,
         val themeCtor: Constructor<*>,
         val prefGetInt: Method,
         val prefKey: String,
@@ -487,6 +493,49 @@ internal object SummaryQueue {
         fun ctx(): Context = appContextMethod.invoke(null) as Context
     }
 
+    /**
+     * 混淆符号集 —— 跨版本漂移风险所在：
+     * - 层1：按 17.8.8 已知混淆名直接 `Class.forName` + `getMethod`；
+     * - 层2：层1 失败时由 [SummaryDexKitResolver] 按字符串锚点/结构特征重定位。
+     *
+     * 两个类名（u 接口 / model）也会漂移，所以一并放进本集合。
+     */
+    internal class ObfuscatedDeps(
+        val uClass: Class<*>,
+        val register: Method,
+        val unregister: Method,
+        val post: Method,
+        val cancel: Method,
+        val cacheGet: Method,
+        val modelCtor: Constructor<*>
+    )
+
+    internal class Resolved(
+        val source: String,
+        val common: CommonDeps,
+        val obf: ObfuscatedDeps
+    ) {
+        val uClass: Class<*> get() = obf.uClass
+        val register: Method get() = obf.register
+        val unregister: Method get() = obf.unregister
+        val post: Method get() = obf.post
+        val cancel: Method get() = obf.cancel
+        val cacheGet: Method get() = obf.cacheGet
+        val checkConvertComplete: Method get() = common.checkConvertComplete
+        val queryRecordById: Method get() = common.queryRecordById
+        val modelCtor: Constructor<*> get() = obf.modelCtor
+        val themeCtor: Constructor<*> get() = common.themeCtor
+        val prefGetInt: Method get() = common.prefGetInt
+        val prefKey: String get() = common.prefKey
+        val getRecordType: Method get() = common.getRecordType
+        val getDateCreated: Method get() = common.getDateCreated
+        val getDuration: Method get() = common.getDuration
+        val getCallName: Method get() = common.getCallName
+        val getData: Method get() = common.getData
+
+        fun ctx(): Context = common.ctx()
+    }
+
     private fun resolve(): Resolved? {
         resolved?.let { return it }
         if (resolveFailed) return null
@@ -494,58 +543,94 @@ internal object SummaryQueue {
         return synchronized(lock) {
             resolved?.let { return it }
             if (resolveFailed) return null
-            val r = try {
-                val qCls = Class.forName(CLS_SUMMARY_TASK_MANAGER, false, cl)
-                val modelCls = Class.forName(CLS_SUMMARY_REQUEST_MODEL, false, cl)
-                val themeCls = Class.forName(CLS_SUMMARY_THEME, false, cl)
-                val uCls = Class.forName(CLS_SUMMARY_CALLBACK, false, cl)
-                val cacheDbCls = Class.forName(CLS_SUMMARY_CACHE_DB, false, cl)
-                val prefCls = Class.forName(CLS_PREF_UTIL, false, cl)
-                val appCls = Class.forName(CLS_BASE_APPLICATION, false, cl)
-                val recordCls = Class.forName(CLS_RECORD, false, cl)
-                Resolved(
-                    uClass = uCls,
-                    register = qCls.getMethod(M_SUMMARY_REG_CALLBACK, java.lang.Long.TYPE, uCls),
-                    unregister = qCls.getMethod(M_SUMMARY_UNREG_CALLBACK, java.lang.Long.TYPE, uCls),
-                    post = qCls.getMethod(M_SUMMARY_POST, modelCls),
-                    cancel = qCls.getMethod(M_SUMMARY_CANCEL, java.lang.Long.TYPE),
-                    cacheGet = cacheDbCls.getMethod(M_SUMMARY_CACHE_GET, java.lang.Long.TYPE),
-                    checkConvertComplete = Class.forName(CLS_CONVERT_DB_UTIL, false, cl)
-                        .getMethod(M_CHECK_ALREADY_CONVERT_COMPLETE, java.lang.Long.TYPE),
-                    queryRecordById = Class.forName(CLS_MEDIA_DB_UTILS, false, cl)
-                        .getMethod(M_QUERY_RECORD_BY_ID, java.lang.Long.TYPE),
-                    modelCtor = modelCls.getConstructor(
-                        java.lang.Long.TYPE,    // mediaId
-                        Integer.TYPE,           // recordType
-                        java.lang.Long.TYPE,    // recordTime
-                        themeCls,               // theme（可 null）
-                        java.lang.Long.TYPE,    // recordDuration
-                        String::class.java,     // recordCallName
-                        String::class.java,     // recordFilePath
-                        Integer.TYPE,           // whereFrom
-                        java.lang.Boolean.TYPE, // usedDefaultTemplate
-                        Integer.TYPE            // 默认参数掩码
-                    ),
-                    themeCtor = themeCls.getConstructor(Integer.TYPE, String::class.java),
-                    prefGetInt = prefCls.getMethod(
-                        M_GET_INT, Context::class.java, String::class.java, Integer.TYPE
-                    ),
-                    prefKey = prefCls.getField(F_DEFAULT_THEME_KEY).get(null) as String,
-                    appContextMethod = appCls.getMethod(M_APP_CONTEXT),
-                    getRecordType = recordCls.getMethod("getRecordType"),
-                    getDateCreated = recordCls.getMethod("getDateCreated"),
-                    getDuration = recordCls.getMethod("getDuration"),
-                    getCallName = recordCls.getMethod("getCallName"),
-                    getData = recordCls.getMethod("getData")
-                )
-            } catch (t: Throwable) {
-                XLog.w("summary engine resolve failed: ${t.message}")
+            val r = tryResolve(cl)
+            if (r == null) {
+                XLog.w("summary engine resolve failed (layer1 + dexkit), summary disabled")
                 resolveFailed = true
-                return null
+                null
+            } else {
+                resolved = r
+                XLog.i("summary engine resolved via ${r.source}")
+                r
             }
-            resolved = r
-            XLog.i("summary engine resolved (AISummaryTaskManager headless path)")
-            r
+        }
+    }
+
+    private fun tryResolve(cl: ClassLoader): Resolved? {
+        val common = resolveCommon(cl) ?: return null
+        // 层1：17.8.8 已知混淆名
+        val known = resolveKnownNames(cl, common.themeCls)
+        // 层2：DexKit 兜底（仅层1失败才启动；结果进程内缓存，每进程至多一次）
+        val obf = known ?: apkPath?.let { SummaryDexKitResolver.find(cl, it, common.themeCls) }
+            ?: return null
+        return Resolved(
+            source = if (known != null) "layer1 (known names)" else "layer2 (dexkit)",
+            common = common,
+            obf = obf
+        )
+    }
+
+    /** 未混淆符号解析：任何一项缺失都整体失败（这些名字不混淆，失败说明版本大改）。 */
+    private fun resolveCommon(cl: ClassLoader): CommonDeps? {
+        return try {
+            val themeCls = Class.forName(CLS_SUMMARY_THEME, false, cl)
+            val recordCls = Class.forName(CLS_RECORD, false, cl)
+            val prefCls = Class.forName(CLS_PREF_UTIL, false, cl)
+            val appCls = Class.forName(CLS_BASE_APPLICATION, false, cl)
+            CommonDeps(
+                checkConvertComplete = Class.forName(CLS_CONVERT_DB_UTIL, false, cl)
+                    .getMethod(M_CHECK_ALREADY_CONVERT_COMPLETE, java.lang.Long.TYPE),
+                queryRecordById = Class.forName(CLS_MEDIA_DB_UTILS, false, cl)
+                    .getMethod(M_QUERY_RECORD_BY_ID, java.lang.Long.TYPE),
+                themeCls = themeCls,
+                themeCtor = themeCls.getConstructor(Integer.TYPE, String::class.java),
+                prefGetInt = prefCls.getMethod(
+                    M_GET_INT, Context::class.java, String::class.java, Integer.TYPE
+                ),
+                prefKey = prefCls.getField(F_DEFAULT_THEME_KEY).get(null) as String,
+                appContextMethod = appCls.getMethod(M_APP_CONTEXT),
+                getRecordType = recordCls.getMethod("getRecordType"),
+                getDateCreated = recordCls.getMethod("getDateCreated"),
+                getDuration = recordCls.getMethod("getDuration"),
+                getCallName = recordCls.getMethod("getCallName"),
+                getData = recordCls.getMethod("getData")
+            )
+        } catch (t: Throwable) {
+            XLog.w("summary common deps resolve failed: ${t.message}")
+            null
+        }
+    }
+
+    /** 层1：按 17.8.8 观测到的混淆名直接解析。 */
+    private fun resolveKnownNames(cl: ClassLoader, themeCls: Class<*>): ObfuscatedDeps? {
+        return try {
+            val qCls = Class.forName(CLS_SUMMARY_TASK_MANAGER, false, cl)
+            val uCls = Class.forName(CLS_SUMMARY_CALLBACK, false, cl)
+            val modelCls = Class.forName(CLS_SUMMARY_REQUEST_MODEL, false, cl)
+            val cacheDbCls = Class.forName(CLS_SUMMARY_CACHE_DB, false, cl)
+            ObfuscatedDeps(
+                uClass = uCls,
+                register = qCls.getMethod(M_SUMMARY_REG_CALLBACK, java.lang.Long.TYPE, uCls),
+                unregister = qCls.getMethod(M_SUMMARY_UNREG_CALLBACK, java.lang.Long.TYPE, uCls),
+                post = qCls.getMethod(M_SUMMARY_POST, modelCls),
+                cancel = qCls.getMethod(M_SUMMARY_CANCEL, java.lang.Long.TYPE),
+                cacheGet = cacheDbCls.getMethod(M_SUMMARY_CACHE_GET, java.lang.Long.TYPE),
+                modelCtor = modelCls.getConstructor(
+                    java.lang.Long.TYPE,    // mediaId
+                    Integer.TYPE,           // recordType
+                    java.lang.Long.TYPE,    // recordTime
+                    themeCls,               // theme（可 null）
+                    java.lang.Long.TYPE,    // recordDuration
+                    String::class.java,     // recordCallName
+                    String::class.java,     // recordFilePath
+                    Integer.TYPE,           // whereFrom
+                    java.lang.Boolean.TYPE, // usedDefaultTemplate
+                    Integer.TYPE            // 默认参数掩码
+                )
+            )
+        } catch (t: Throwable) {
+            XLog.d("summary layer1 (known names) failed: ${t.message}")
+            null
         }
     }
 

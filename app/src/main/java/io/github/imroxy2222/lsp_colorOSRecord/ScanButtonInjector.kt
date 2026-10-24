@@ -40,8 +40,8 @@ import java.lang.reflect.Method
  * 调 trigger.onMediaIdSynced 触发转文本；trigger 内部有 checkAlreadyConvertComplete
  * + 60s 去重兜底，队列 drain 时仍会再跳过已转/运行中的条目。
  *
- * 设计原因：VoIP 通话录音（QQ/微信）结束时录音机进程不运行，模块无法自动触发。
- * 改为用户打开录音机 App 后，在展开菜单点一下批量触发，进程肯定存活。
+ * 设计原因：入库自动触发路线（hook RecorderProvider 写库）实测走不通，已删除；
+ * 录音机 App 进程内点菜单批量触发是唯一转文本入口，进程必然存活。
  */
 class ScanButtonInjector(
     private val api: XposedInterface,

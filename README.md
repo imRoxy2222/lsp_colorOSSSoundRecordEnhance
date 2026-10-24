@@ -2,7 +2,7 @@
 
 一个作用于 ColorOS 系统录音机（`com.coloros.soundrecorder`）的 [LSPosed](https://github.com/LSPosed/LSPosed) 模块。
 
-通话录音入库后**自动触发"录音转文本"**，无需手动逐条点击；录音列表右上角菜单支持**一键批量转文本**；批量转写完成后可**自动生成 AI 摘要**（可开关）；原生搜索原本只能搜"摘要"，本模块为其注入了**转写正文全文搜索**能力。
+录音列表右上角菜单支持**一键批量转文本**（全部录音类型，排除回收站）；批量转写完成后可**自动生成 AI 摘要**（可开关）；原生搜索原本只能搜"摘要"，本模块为其注入了**转写正文全文搜索**能力。
 
 > 模块无界面、无桌面图标，全部功能均在录音机进程内通过 Hook 实现。
 
@@ -43,23 +43,20 @@
 ## 🔧 实现原理
 
 ```
-通话录音写库（所有链路）
+用户点击列表菜单"转文本 / 转全部"
         │
         ▼
-RecorderProvider#insert/bulkInsert  ──after──▶  record_type==3 ?
-        │                                            │ 反查 MediaStore 拿 mediaId
-        │                                            ▼
-        │                                    TriggerHandle（去重/防重）
-        │                                            │ 反射 startConvertTask
-        │                                            ▼
-        │                                    ConvertQueue 串行队列
-        │                                            │ 完成回调 hook
-        │                                            ▼
-        │                    开关开 ──▶ SummaryQueue 摘要串行队列（复用宿主
-        │                              AISummaryTaskManager 无 UI 投递管道）
-        │                                            │ 完成回调 hook
-        │                                            ▼
-        │                              ConvertIndexer → FTS 索引
+扫描 records 表（record_type IN (0,1,2,3,5,6,7) AND is_recycle = 0，
+最新优先，跳过已转完的）
+        │
+        ▼
+ConvertQueue 串行队列 ──▶ TriggerHandle（去重/防重）──反射──▶ startConvertTask
+        │ 完成回调 hook（在线/离线/后台三条链路）
+        ▼
+开关开 ──▶ SummaryQueue 摘要串行队列（复用宿主 AISummaryTaskManager 无 UI 投递管道）
+        │ 完成回调 hook
+        ▼
+ConvertIndexer → FTS 索引
         │
 搜索时：摘要关键字查询 hook ──after──▶ FTS 查询转写正文，注入结果
 ```
@@ -67,7 +64,7 @@ RecorderProvider#insert/bulkInsert  ──after──▶  record_type==3 ?
 **Hook 定位采用两层策略，兼顾稳定性与跨版本兼容：**
 
 - **层 1**：直接 `Class.forName` 已知类名（录音机的 Kotlin 业务类大多未混淆）；
-- **层 2**：层 1 失败时，用 [DexKit](https://github.com/LuckyPray/DexKit) 在后台线程按结构特征 / SQL 字符串锚点重新定位（不阻塞 App 启动），跨版本漂移也能兜底。
+- **层 2**：层 1 失败时，用 [DexKit](https://github.com/LuckyPray/DexKit) 在后台线程按结构特征 / 字符串锚点（日志串、SQL 串、构造器签名）重新定位（不阻塞 App 启动），跨版本漂移也能兜底。转文本触发与摘要管道（后者核心符号是单字母混淆名，漂移风险最高）都接入了层 2；定位结果进程内缓存，每进程至多解析一次。
 
 所有 Hook 均为 `PROTECTIVE` 异常模式 + 全量 try-catch：模块自身异常只进 Xposed 日志，绝不影响录音机原有流程。
 
@@ -81,6 +78,7 @@ RecorderProvider#insert/bulkInsert  ──after──▶  record_type==3 ?
 | `ConvertQueue.kt`                             | 完成事件驱动的串行转文本队列         |
 | `ScanButtonInjector.kt`                       | 注入"转文本 / 转全部 / 生成摘要开关"菜单项 |
 | `SummaryQueue.kt`                             | 转写后自动摘要：开关持久化 + 串行摘要队列（复用宿主 AISummaryTaskManager 管道） |
+| `SummaryDexKitResolver.kt`                    | 摘要管道混淆符号的 DexKit 层 2 定位  |
 | `SearchInjector.kt`                           | 转写正文搜索结果注入                 |
 | `ConvertIndexer.kt` / `ConvertSearchIndex.kt` | FTS 索引调度与实现                   |
 | `XLog.kt`                                     | 日志封装                             |
@@ -118,15 +116,15 @@ RecorderProvider#insert/bulkInsert  ──after──▶  record_type==3 ?
 3. 作用域勾选 **ColorOS 录音机**（`com.coloros.soundrecorder`，模块声明为静态作用域，一般会自动勾选）；
 4. 重启系统界面或重启手机，打开录音机验证。
 
-验证方式：打开录音机后，在 LSPosed 管理器日志中能看到 `module loaded` / `hooked ...` 等日志；通话录音入库后数秒内出现"转文本已完成"提示。
+验证方式：打开录音机后，在 LSPosed 管理器日志中能看到 `module loaded` / `hooked ...` 等日志；点右上角菜单"转文本"后出现逐条"转文本已完成"提示。
 
 ## 🙋 FAQ
 
-**Q：手动录的音也会被自动转文本吗？**
-不会。自动触发仅针对 `record_type == 3` 的通话录音，手动录音走的是另一条链路，不受影响。
+**Q：录音会自动转文本吗？**
+不会。转文本唯一入口是列表右上角菜单的"转文本 / 转全部"（入库自动触发路线实测不可靠，已移除）。record_type 各取值含义见 [doc/录音Record_Type描述.md](doc/录音Record_Type描述.md)。
 
 **Q：QQ / 微信电话录音为什么没有自动转？**
-VoIP 通话结束时录音机进程通常不在运行，Hook 不存在。打开录音机后点右上角菜单的"转文本"或"转全部"即可批量处理。
+VoIP 通话结束时录音机进程通常不在运行。打开录音机后点右上角菜单的"转文本"或"转全部"即可批量处理。
 
 **Q：搜索里出现的「转文本：」结果是什么？**
 这是模块注入的转写正文全文搜索命中，非原生摘要。App 原有的关键词高亮和点击跳转均正常可用。

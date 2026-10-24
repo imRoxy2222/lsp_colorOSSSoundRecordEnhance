@@ -3,10 +3,10 @@ package io.github.imroxy2222.lsp_colorOSRecord
 import java.lang.reflect.Method
 
 /**
- * 通话录音同步入库后的转文本触发器。
+ * 转文本触发器（供 ConvertQueue 串行队列逐条调用）。
  *
- * 核心逻辑（由 RecorderProvider.insert/bulkInsert 的 after-hook 调用）：
- * 1. 60s 时间窗去重（同一记录可能经多条上游路径 / 多次写库触发）；
+ * 核心逻辑（由 ConvertQueue.drainNextLocked 对每条待转 mediaId 调用）：
+ * 1. 60s 时间窗去重（同一记录可能被重复入队/触发）；
  * 2. `ConvertDbUtil.checkAlreadyConvertComplete(mediaId)` 已转完则跳过；
  *    （可选加固）`ConvertTaskThreadManager.checkIsTaskRunning(mediaId)` 正在跑则跳过；
  * 3. 反射调用 `ConvertTaskApi.INSTANCE.startConvertTask(mediaId)`。
