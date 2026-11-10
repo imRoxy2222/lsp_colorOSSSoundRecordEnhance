@@ -42,6 +42,37 @@ internal const val M_SUMMARY_UNREG_CALLBACK = "i"  // i(long, u) 注销回调
 internal const val M_SUMMARY_CANCEL = "b"          // b(long) 取消运行中任务
 internal const val M_SUMMARY_CACHE_GET = "f"       // database.b#f(long) 查已生成摘要缓存
 
+/**
+ * SummaryRequestModel 主构造的 Kotlin 默认参数掩码（照抄官方 SummaryGenerateAiCommand）。
+ * - 17.8.8：10 参构造，官方 `new o(..., 0, false, 776)`
+ * - 17.9.6： 9 参构造，官方 `new o(..., 0, 264)` —— 删除了 usedDefaultTemplate 字段
+ * 两者 bit3(8) 都让 theme 走默认 null、whereFrom 取传入 0，语义一致。
+ */
+internal const val SUMMARY_MODEL_MASK_10 = 776
+internal const val SUMMARY_MODEL_MASK_9 = 264
+
+/**
+ * 定位 SummaryRequestModel 的公开主构造，跨版本自适应（不再硬编码参数个数）。
+ *
+ * 17.8.8 `(long,int,long,SummaryTheme,long,String,String,int,boolean,int)` — 10 参
+ * 17.9.6 `(long,int,long,SummaryTheme,long,String,String,int,int)`         —  9 参
+ *
+ * 前 8 参与末位 int 掩码恒定，第 9 位（boolean usedDefaultTemplate）为 17.8.8 独有。
+ * 这是 17.9.6 摘要管道定位失败的唯一根因：层1 的 getConstructor(10 参) 与层2 DexKit
+ * 的 paramTypes(10 参) 会同时落空，导致整条管道被误判为"缺失"。
+ */
+internal fun findSummaryModelCtor(modelCls: Class<*>, themeCls: Class<*>): Constructor<*>? =
+    modelCls.declaredConstructors.firstOrNull { c ->
+        val p = c.parameterTypes
+        (p.size == 9 || p.size == 10) &&
+            p[0] == java.lang.Long.TYPE && p[1] == Integer.TYPE &&
+            p[2] == java.lang.Long.TYPE && p[3] == themeCls &&
+            p[4] == java.lang.Long.TYPE && p[5] == String::class.java &&
+            p[6] == String::class.java && p[7] == Integer.TYPE &&
+            p[p.size - 1] == Integer.TYPE &&
+            (p.size == 9 || p[8] == java.lang.Boolean.TYPE)
+    }?.apply { isAccessible = true }
+
 /** MediaDBUtils#queryRecordById(long)。 */
 internal const val M_QUERY_RECORD_BY_ID = "queryRecordById"
 
@@ -108,8 +139,8 @@ internal object SummaryPrefs {
  *
  * ```
  * MediaDBUtils.queryRecordById(mediaId)                       → Record
- * new SummaryRequestModel(mediaId, recordType, recordTime,    → 模型（掩码 776：
- *     theme, duration, callName, data, 0, false, 776)            theme 用默认值，后续补)
+ * new SummaryRequestModel(mediaId, recordType, recordTime,    → 模型（10 参/9 参自适应，
+ *     theme, duration, callName, data, 0, [false,] mask)         掩码 17.8.8=776 / 17.9.6=264）
  * PrefUtil.getInt(ctx, KEY_DEFAULT_SUMMARY_THEME_CODE, -1)    → 用户默认模板 → SummaryTheme
  * q.g(mediaId, callback)                                      → 注册事件回调（动态代理 u）
  * q.h(model)                                                  → 投递（内部限 1 条并发）
@@ -326,7 +357,10 @@ internal object SummaryQueue {
             null
         }
 
-        val model = r.modelCtor.newInstance(
+        // 构造参数按宿主版本自适应：17.8.8 为 10 参（含 boolean usedDefaultTemplate），
+        // 17.9.6 为 9 参（该字段被删除）；掩码同步取各版本官方同款值。
+        val ctor = r.modelCtor
+        val baseArgs = arrayOf<Any?>(
             mediaId,
             r.getRecordType.invoke(record) as Int,
             r.getDateCreated.invoke(record) as Long,
@@ -334,10 +368,14 @@ internal object SummaryQueue {
             r.getDuration.invoke(record) as Long,
             (r.getCallName.invoke(record) as? String) ?: "",
             (r.getData.invoke(record) as? String) ?: "",
-            0,           // whereFrom = 0（非卡片入口）
-            false,
-            776          // Kotlin 默认参数掩码：theme / usedDefaultTemplate 走默认（与官方一致）
+            0            // whereFrom = 0（非卡片入口）
         )
+        val modelArgs: Array<Any?> = if (ctor.parameterTypes.size == 10) {
+            arrayOf<Any?>(*baseArgs, false, SUMMARY_MODEL_MASK_10)
+        } else {
+            arrayOf<Any?>(*baseArgs, SUMMARY_MODEL_MASK_9)
+        }
+        val model = ctor.newInstance(*modelArgs)
 
         // 事件回调动态代理：Finished → 成功；Error → 记错误码。
         // 注意必须正确代理 Object 方法（equals/hashCode/toString）——
@@ -635,18 +673,9 @@ internal object SummaryQueue {
                 post = qCls.getMethod(M_SUMMARY_POST, modelCls),
                 cancel = qCls.getMethod(M_SUMMARY_CANCEL, java.lang.Long.TYPE),
                 cacheGet = cacheDbCls.getMethod(M_SUMMARY_CACHE_GET, java.lang.Long.TYPE),
-                modelCtor = modelCls.getConstructor(
-                    java.lang.Long.TYPE,    // mediaId
-                    Integer.TYPE,           // recordType
-                    java.lang.Long.TYPE,    // recordTime
-                    themeCls,               // theme（可 null）
-                    java.lang.Long.TYPE,    // recordDuration
-                    String::class.java,     // recordCallName
-                    String::class.java,     // recordFilePath
-                    Integer.TYPE,           // whereFrom
-                    java.lang.Boolean.TYPE, // usedDefaultTemplate
-                    Integer.TYPE            // 默认参数掩码
-                )
+                // 构造签名跨版本会变（17.8.8 10 参 / 17.9.6 9 参），按形状自适应识别
+                modelCtor = findSummaryModelCtor(modelCls, themeCls)
+                    ?: throw NoSuchMethodException("SummaryRequestModel ctor shape not recognized")
             )
         } catch (t: Throwable) {
             XLog.d("summary layer1 (known names) failed: ${t.message}")

@@ -47,6 +47,16 @@ internal class SearchInjector(
     private val snippetRegistry = HashSet<String>()
 
     fun install() {
+        // 结果伪装能力独立上报：不受后续 DAO / bind 任何定位结果影响。
+        // 早期把探测放在 installTranscriptLabelFix 的 bind 成功分支之后，
+        // 17.9.6 里 bind 失败即提前 return，导致本项长期误显示「定位中」。
+        val ctorProbe = entityConstructor()
+        if (ctorProbe != null) {
+            HookStatus.found("search_entity", "层1", "实际: ${ctorProbe.declaringClass.name}")
+        } else {
+            HookStatus.missing("search_entity", "23 参构造未找到（转写搜索注入失效）")
+        }
+
         val method = locateQueryMethod() ?: run {
             XLog.w("summary keyword query not found, transcript search disabled")
             return
@@ -194,17 +204,15 @@ internal class SearchInjector(
     // ---------------------------------------------------------------- 注入条目标签修正（摘要 → 转文本）
 
     /**
-     * app 原生把摘要内容显示为 "摘要：xxx"（xg.b.D() 里 getString(R.string.summary_with_colon) 前缀）。
+     * app 原生把摘要内容显示为 "摘要：xxx"（条目 ViewHolder 的 bind 方法里
+     * getString(R.string.summary_with_colon) 前缀；17.8.8 = xg.b.D()，17.9.6 = dh.c.F()）。
      * 转写注入条目伪装成摘要走同一条 UI 路径，因此需把标签改回"转文本："。
      *
-     * 做法：hook 搜索条目绑定方法（17.8.8 为 xg.b.D()，无参 void；类名与方法名均为混淆名：
-     * 类由 DexKit 日志锚点兜底，方法由内联资源 id（summary_with_colon）DexKit 兜底，见
-     * [locateSearchItemBind]），after 阶段取 itemView 里的 summary_text TextView：
-     * - 文本以"摘要："开头、且内容匹配本次注入片段指纹 → 原地替换前缀为"转文本："
-     *   （SpannableStringBuilder 复制后 replace，前缀样式 span 重新铺上，关键词高亮位置随 replace 自动平移）；
+     * 做法：hook 搜索条目绑定方法，after 阶段取 itemView 里的 summary_text TextView：
+     * - 文本以"摘要："开头、且内容匹配本次注入片段指纹 → 原地替换前缀为"转文本："；
      * - 其余情况（真摘要 / 中心搜索结果）一律不动。
      *
-     * 幂等：改写后文本以"转文本："开头，startsWith("摘要：") 不再成立，重复绑定不会二次处理。
+     * 幂等：改写后文本以"转文本："开头，startsWith("摘要：") 不再成立。
      */
     private fun installTranscriptLabelFix() {
         val summaryTextId = resolveRId(
@@ -213,28 +221,27 @@ internal class SearchInjector(
             "summary_text",
         ) ?: run {
             XLog.w("R.id.summary_text not found, transcript label fix disabled")
+            HookStatus.missing("search_bind", "R.id.summary_text 未解析（标签修正停用）")
             return
         }
-        // summary_with_colon 的资源 id 兼作 bind 方法的 DexKit 锚点（D() 会内联该 id 常量）
+        // summary_with_colon 的资源 id 兼作绑定方法的 DexKit 锚点（bind 会内联该 id 常量）
         val summaryPrefixId = resolveRId(
             param.classLoader,
             "com.soundrecorder.common.R\$string",
             "summary_with_colon",
         ) ?: run {
             XLog.w("R.string.summary_with_colon not found, transcript label fix disabled")
+            HookStatus.missing("search_bind", "R.string.summary_with_colon 未解析（标签修正停用）")
             return
         }
         val bindMethod = locateSearchItemBind(summaryPrefixId) ?: run {
             XLog.w("search item viewholder bind not found, transcript label fix disabled")
-            HookStatus.missing("search_bind", "定位失败（注入条目会显示为\"摘要：\"前缀，功能不受影响）")
+            // 内层已写入更具体的失败层时，不要用通用文案覆盖它
+            HookStatus.missingIfPending(
+                "search_bind",
+                "定位失败（注入条目会显示为\"摘要：\"前缀，功能不受影响）",
+            )
             return
-        }
-        // 结果伪装依赖 SummaryCacheEntity 23 参构造（安装时探测一次并上报）
-        val ctorProbe = entityConstructor()
-        if (ctorProbe != null) {
-            HookStatus.found("search_entity", "层1", "实际: ${ctorProbe.declaringClass.name}")
-        } else {
-            HookStatus.missing("search_entity", "23 参构造未找到（转写搜索注入失效）")
         }
         api.hook(bindMethod)
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -250,47 +257,54 @@ internal class SearchInjector(
     }
 
     /**
-     * 定位搜索条目绑定方法：
-     * - 类：层1 已知混淆名 xg.b；层2 DexKit 日志锚点 "convert click isQuickClick"（构造器内，全局唯一）；
-     * - 方法：层1 已知混淆名 D；层2 DexKit 按内联资源 id 锚定 —— D() 内联了
-     *   R.string.summary_with_colon 的 id 常量（xg.b 内仅此一处使用），类内该 id +
-     *   无参 + void 的组合唯一（另一个无参 void 方法 x() 是 onRelease，不含该 id）。
+     * 定位搜索条目绑定方法（跨版本自适应）：
+     * - 类：混淆名候选仅作快速路径，且必须通过稳定基类 [CLS_ITEM_SEARCH_BASE] 校验。
+     *   17.9.6 的 dex 里 xg.b 与 dh.c 同时存在（前者是 RecyclerView behavior 相关类），
+     *   早期「能加载即采用」会先命中 xg.b，导致类内方法 / id 锚点全部落空，
+     *   诊断报「标签修正缺失」。候选全部不合格时用稳定串 "ItemSearchView" 做 DexKit 兜底。
+     * - 方法：主路径从基类 h 的「抽象无参 void」方法名反推（17.8.8 = D，17.9.6 = F），
+     *   不依赖混淆方法名；再保留已知候选名与内联资源 id 的 DexKit 兜底。
      */
     private fun locateSearchItemBind(summaryPrefixId: Int): Method? {
         val cl = param.classLoader
-        var cls: Class<*>? = try {
-            Class.forName(CLS_ITEM_SEARCH_VIEW, false, cl)
-        } catch (t: Throwable) {
-            null
-        }
-        if (cls == null) {
-            cls = try {
-                DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
-                    val found = bridge.findClass {
-                        matcher { usingStrings(ANCHOR_SEARCH_ITEM_VIEW) }
-                    }
-                    found.firstOrNull()?.let { Class.forName(it.name, false, cl) }
-                }
-            } catch (t: Throwable) {
-                XLog.w("dexkit search item viewholder locate failed", t)
-                null
-            }
-        }
-        val c = cls ?: run {
-            HookStatus.missing("search_bind", "类未定位（xg.b 名称漂移且日志锚点失效）")
+        val base = searchItemBase(cl)
+        val c = resolveSearchItemClass(cl, base) ?: run {
+            HookStatus.missing("search_bind", "类未定位（混淆名候选均未通过基类校验且 DexKit 锚点失效）")
             return null
         }
-        // 层1：按已知名 D
+        XLog.d("search item view class: ${c.name}")
+
+        // 层1：稳定基类 h 中唯一的抽象无参 void 方法即 bind 方法声明
+        val baseNames = (base?.declaredMethods ?: emptyArray())
+            .filter {
+                Modifier.isAbstract(it.modifiers) && it.parameterTypes.isEmpty() &&
+                    it.returnType == Void.TYPE
+            }
+            .map { it.name }
+            .toSet()
+        val byBase = c.declaredMethods.firstOrNull {
+            !Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
+                it.returnType == Void.TYPE && it.name in baseNames
+        }
+        if (byBase != null) {
+            byBase.isAccessible = true
+            XLog.i("search item bind located (base signature): ${c.name}#${byBase.name}")
+            HookStatus.found("search_bind", "层1(基类签名)", "实际: ${c.name}#${byBase.name}")
+            return byBase
+        }
+
+        // 层1b：已知混淆方法名候选（类已通过基类校验，不会误命中同名无关类）
         val byName = c.declaredMethods.firstOrNull {
             !Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
-                it.returnType == Void.TYPE && it.name == M_BIND_SEARCH_ITEM
+                it.returnType == Void.TYPE && it.name in M_BIND_SEARCH_ITEM_CANDIDATES
         }
         if (byName != null) {
             byName.isAccessible = true
-            HookStatus.found("search_bind", "层1", "实际: ${c.name}#${byName.name}")
+            HookStatus.found("search_bind", "层1(候选名)", "实际: ${c.name}#${byName.name}")
             return byName
         }
-        // 层2：方法名漂移 → 用内联资源 id 兜底（类内唯一）
+
+        // 层2：方法名继续漂移 → 用内联资源 id 兜底，优先取已知候选名
         return try {
             DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
                 val found = bridge.findMethod {
@@ -302,18 +316,69 @@ internal class SearchInjector(
                     }
                 }
                 XLog.d("dexkit bind method candidates: ${found.size}")
-                found.firstOrNull()?.getMethodInstance(cl)?.also {
+                val picked = found.firstOrNull { it.name in M_BIND_SEARCH_ITEM_CANDIDATES }
+                    ?: found.firstOrNull()
+                picked?.getMethodInstance(cl)?.also {
                     it.isAccessible = true
                     XLog.i("search item bind located (dexkit id-anchor): ${c.name}#${it.name}")
                     HookStatus.found("search_bind", "DexKit(id 锚点)", "实际: ${c.name}#${it.name}")
                 } ?: run {
-                    HookStatus.missing("search_bind", "id 锚点未命中（方法签名可能变化）")
+                    HookStatus.missing("search_bind", "id 锚点未命中（类=${c.name}，方法签名可能变化）")
                     null
                 }
             }
         } catch (t: Throwable) {
             XLog.w("dexkit bind method locate failed", t)
             HookStatus.missing("search_bind", "DexKit 定位异常: ${t.message}")
+            null
+        }
+    }
+
+    /** 搜索条目 ViewHolder 的稳定抽象基类（未混淆）。 */
+    private fun searchItemBase(cl: ClassLoader): Class<*>? = try {
+        Class.forName(CLS_ITEM_SEARCH_BASE, false, cl)
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** 候选混淆名必须确为 h 的子类；基类不可用时退化为方法形状校验。 */
+    private fun isSearchItemView(c: Class<*>, base: Class<*>?): Boolean {
+        if (base != null) {
+            var p: Class<*>? = c.superclass
+            while (p != null) {
+                if (p == base) return true
+                p = p.superclass
+            }
+            return false
+        }
+        return c.declaredMethods.any {
+            !Modifier.isStatic(it.modifiers) && it.parameterTypes.isEmpty() &&
+                it.returnType == Void.TYPE && it.name in M_BIND_SEARCH_ITEM_CANDIDATES
+        }
+    }
+
+    /** 逐个验证候选类名；全部不合格时用稳定串 "ItemSearchView" 做 DexKit 兜底。 */
+    private fun resolveSearchItemClass(cl: ClassLoader, base: Class<*>?): Class<*>? {
+        for (name in CLS_ITEM_SEARCH_VIEW_CANDIDATES) {
+            val c = try { Class.forName(name, false, cl) } catch (_: Throwable) { null } ?: continue
+            if (!isSearchItemView(c, base)) {
+                XLog.d("search item candidate rejected: $name (super=${c.superclass?.name})")
+                continue
+            }
+            XLog.i("search item view located (layer1): ${c.name}")
+            return c
+        }
+        return try {
+            DexKitBridge.create(param.applicationInfo.sourceDir).use { bridge ->
+                bridge.findClass {
+                    matcher { usingStrings(ANCHOR_SEARCH_ITEM_VIEW_TAG) }
+                }.mapNotNull { data ->
+                    try { Class.forName(data.name, false, cl) } catch (_: Throwable) { null }
+                }.firstOrNull { c -> isSearchItemView(c, base) }
+                    ?.also { XLog.i("search item view located (dexkit tag): ${it.name}") }
+            }
+        } catch (t: Throwable) {
+            XLog.w("dexkit search item view locate failed", t)
             null
         }
     }
@@ -399,7 +464,7 @@ internal class SearchInjector(
     }
 
     /**
-     * 23 参构造（17.8.8，f.b(String) 的游标映射顺序）：
+     * 23 参构造（17.8.8 与 17.9.6 复核完全一致，f.b(String) 的游标映射顺序）：
      * (long id, long mediaId, long timeStamp, int chooseState, String summaryContent,
      *  String summaryAgent, String summaryEntity, String summaryTrace, int summaryStyle,
      *  String summaryTheme, String title, String language, long lastSelectTime, int userStop,

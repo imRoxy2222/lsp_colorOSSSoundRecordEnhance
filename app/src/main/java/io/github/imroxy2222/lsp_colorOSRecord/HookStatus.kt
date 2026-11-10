@@ -99,7 +99,11 @@ internal object HookStatus {
         // 搜索注入链
         register("search_dao", "搜索注入·摘要关键字查询", "summary.request.database.f#b(String)")
         register("search_entity", "搜索注入·结果伪装", "SummaryCacheEntity 23 参构造")
-        register("search_bind", "搜索注入·标签修正（摘要→转文本）", "xg.b#D()")
+        register(
+            "search_bind",
+            "搜索注入·标签修正（摘要→转文本）",
+            "搜索条目 ViewHolder#bind（h 抽象无参 void 覆写；17.8.8 D / 17.9.6 F）"
+        )
         // 自动摘要链
         register("summary_common", "自动摘要·公共依赖", "SummaryTheme / PrefUtil / Record / BaseApplication")
         register(
@@ -118,6 +122,16 @@ internal object HookStatus {
 
     fun missing(id: String, detail: String? = null) =
         update(id, State.NOT_FOUND, null, detail)
+
+    /** 仅当尚无具体结论时补一条兜底说明，避免覆盖内层已上报的精确失败原因。 */
+    fun missingIfPending(id: String, detail: String? = null) = synchronized(regLock) {
+        entries[id]?.let { e ->
+            if (e.state == State.PENDING) {
+                e.state = State.NOT_FOUND
+                e.detail = detail
+            }
+        }
+    }
 
     fun optionalMissing(id: String, detail: String? = null) =
         update(id, State.OPTIONAL_MISSING, null, detail)

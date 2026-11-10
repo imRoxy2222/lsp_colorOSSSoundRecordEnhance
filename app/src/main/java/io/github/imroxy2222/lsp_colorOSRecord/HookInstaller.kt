@@ -74,11 +74,27 @@ internal const val CLS_SUMMARY_CACHE_ENTITY = "com.soundrecorder.summary.request
 internal const val ANCHOR_SUMMARY_KEYWORD_QUERY =
     "SELECT * FROM summary_cache_data WHERE INSTR(summary_content, ?) > 0 AND choose_state = 0"
 
-/** 搜索结果条目 ViewHolder（17.8.8 混淆类名 xg.b）及其绑定方法 D()（browsefile.home.item.h.D 的实现）。 */
-internal const val CLS_ITEM_SEARCH_VIEW = "xg.b"
-internal const val M_BIND_SEARCH_ITEM = "D"
+/**
+ * 搜索条目 ViewHolder 的稳定抽象基类（未混淆，17.8.8 / 17.9.6 均存在）。
+ * 其中唯一的「抽象无参 void」方法即 bind 方法声明：17.8.8 = D()，17.9.6 = F()。
+ * 用它反推 bind 方法名并校验混淆类名候选，避免 R8 重排后同名无关类抢占。
+ */
+internal const val CLS_ITEM_SEARCH_BASE = "com.soundrecorder.browsefile.home.item.h"
 
-/** xg.b 构造器内注册点击回调的日志串（dex 常量，全局唯一，DexKit 定位兜底）。 */
+/** ViewHolder 构造函数内的稳定标签串（this.B = "ItemSearchView"），DexKit 类锚点。 */
+internal const val ANCHOR_SEARCH_ITEM_VIEW_TAG = "ItemSearchView"
+
+/**
+ * 搜索结果条目 ViewHolder 混淆类名候选（[CLS_ITEM_SEARCH_BASE] 的实现类）。
+ * 17.8.8 = xg.b，17.9.6 = dh.c。注意 17.9.6 的 dex 里 xg.b 仍然存在，
+ * 但已是 RecyclerView behavior 相关的无关类，候选必须经基类校验后才能采用。
+ */
+internal val CLS_ITEM_SEARCH_VIEW_CANDIDATES = arrayOf("xg.b", "dh.c")
+
+/** 绑定方法混淆名候选：17.8.8 = D()，17.9.6 = F()，均为无参 void 的覆写方法。 */
+internal val M_BIND_SEARCH_ITEM_CANDIDATES = arrayOf("D", "F")
+
+/** 点击回调日志串：位于匿名/合成监听器类，不用作类锚点，仅保留作参考。 */
 internal const val ANCHOR_SEARCH_ITEM_VIEW = "convert click isQuickClick"
 
 /** 全局触发器持有者：ScanButtonInjector 通过它拿 trigger 调用转文本。 */

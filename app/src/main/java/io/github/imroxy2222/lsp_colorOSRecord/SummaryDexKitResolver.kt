@@ -5,7 +5,7 @@ import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
-// ---------------------------------------------------------------- DexKit 锚点（17.8.8 反编译，已验证唯一性）
+// ---------------------------------------------------------------- DexKit 锚点（17.8.8 反编译；17.9.6 逐条复核，全部保留且仍唯一）
 
 /** AISummaryTaskManager#register 回调方法内的日志串 —— 全 app 唯一（q.g）。 */
 private const val ANCHOR_REGISTER = "registerAISummaryCallback has container call back"
@@ -35,6 +35,12 @@ private const val M_CB_ERROR = "onAISummaryError"
  * 且仅在层1失败时才启动，正常路径零开销）。
  *
  * 查得类/方法后全部做签名校验再放行，避免锚点撞车误定位。
+ *
+ * **17.9.6 教训**：不要把「构造函数参数个数」当定位锚点。该版本删除了
+ * SummaryRequestModel 的 usedDefaultTemplate 字段，10 参构造变 9 参，导致层1 的
+ * getConstructor 与本层原本的 findClass{paramTypes(10 参)} 同时落空，
+ * 整条摘要管道被误判为「缺失」。现在 model 类改由 q.h 的参数类型反推，
+ * 构造器由 [findSummaryModelCtor] 按形状自适应识别。
  */
 internal object SummaryDexKitResolver {
 
@@ -88,25 +94,19 @@ internal object SummaryDexKitResolver {
             return null
         }
 
-        // 3) model 类：10 参构造器（第 4 参 SummaryTheme 钉死包路径，签名唯一）
-        val modelCls = bridge.findClass {
-            matcher {
-                methods {
-                    add {
-                        name("<init>")
-                        paramTypes(
-                            "long", "int", "long", themeCls.name, "long",
-                            "java.lang.String", "java.lang.String", "int", "boolean", "int"
-                        )
-                    }
-                }
-            }
-        }.firstOrNull()?.let {
-            try { Class.forName(it.name, false, cl) } catch (_: Throwable) { null }
+        // 3) post(h) + model 类：q 内「static、单参对象、返回 boolean」的方法唯一（即 h），
+        //    它的参数类型就是 SummaryRequestModel。
+        //    旧实现按「10 参构造器 paramTypes」定位类；17.9.6 删除 usedDefaultTemplate
+        //    变成 9 参后该特征整体落空，层1 与层2 同时失效。改为从 post 签名反推类型，
+        //    不再依赖构造参数个数，跨版本稳定。
+        val post = qCls.declaredMethods.firstOrNull {
+            Modifier.isStatic(it.modifiers) && it.parameterTypes.size == 1 &&
+                !it.parameterTypes[0].isPrimitive && it.returnType == java.lang.Boolean.TYPE
         } ?: run {
-            XLog.w("summary dexkit: request model class not found")
+            XLog.w("summary dexkit: post not found")
             return null
         }
+        val modelCls = post.parameterTypes[0]
 
         // 4) unregister(i)：q 内静态 (long, u)->void 且异于 register（该签名仅 g/i 两个）
         val unregister = qCls.declaredMethods
@@ -119,19 +119,7 @@ internal object SummaryDexKitResolver {
             return null
         }
 
-        // 5) post(h)：q 内静态、单参 model、返回 boolean（该签名唯一）
-        val post = qCls.declaredMethods
-            .filter {
-                Modifier.isStatic(it.modifiers) &&
-                    it.parameterTypes.size == 1 && it.parameterTypes[0] == modelCls &&
-                    it.returnType == java.lang.Boolean.TYPE
-            }
-            .singleOrNull() ?: run {
-            XLog.w("summary dexkit: post ambiguous")
-            return null
-        }
-
-        // 6) cancel(b)：锚点串 + 签名 (long)->boolean + 声明类限定 q（全局串不唯一，见常量注释）
+        // 5) cancel(b)：锚点串 + 签名 (long)->boolean + 声明类限定 q（全局串不唯一，见常量注释）
         val cancel = bridge.findMethod {
             matcher {
                 usingStrings(ANCHOR_CANCEL)
@@ -144,7 +132,7 @@ internal object SummaryDexKitResolver {
             return null
         }
 
-        // 7) cacheGet(database.b#f)：SQL 串精确匹配 + (long) 参数
+        // 6) cacheGet(database.b#f)：SQL 串精确匹配 + (long) 参数
         val cacheGet = bridge.findMethod {
             matcher {
                 usingStrings(ANCHOR_CACHE_SQL)
@@ -155,10 +143,11 @@ internal object SummaryDexKitResolver {
             return null
         }
 
-        // 8) 签名终检：全部对齐 17.8.8 观测到的形状才放行
+        // 7) 签名终检：全部对齐观测到的形状才放行
         val ok = register.parameterTypes.contentEquals(arrayOf(java.lang.Long.TYPE, uCls)) &&
             register.returnType == Void.TYPE &&
             unregister.returnType == Void.TYPE &&
+            Modifier.isStatic(post.modifiers) &&
             Modifier.isStatic(cancel.modifiers) &&
             cacheGet.returnType.name == CLS_SUMMARY_CACHE_ENTITY
         if (!ok) {
@@ -166,14 +155,8 @@ internal object SummaryDexKitResolver {
             return null
         }
 
-        val modelCtor: Constructor<*> = try {
-            modelCls.getConstructor(
-                java.lang.Long.TYPE, Integer.TYPE, java.lang.Long.TYPE, themeCls,
-                java.lang.Long.TYPE, String::class.java, String::class.java,
-                Integer.TYPE, java.lang.Boolean.TYPE, Integer.TYPE
-            )
-        } catch (t: Throwable) {
-            XLog.w("summary dexkit: model ctor mismatch: ${t.message}")
+        val modelCtor: Constructor<*> = findSummaryModelCtor(modelCls, themeCls) ?: run {
+            XLog.w("summary dexkit: request model ctor shape not recognized")
             return null
         }
 
